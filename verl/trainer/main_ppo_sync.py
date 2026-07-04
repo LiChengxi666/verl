@@ -842,6 +842,26 @@ class PPOTrainer:
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
+        self._snapshot_metrics_file(local_global_step_folder)
+
+    def _snapshot_metrics_file(self, local_global_step_folder: str | None = None):
+        metrics_path = os.getenv("VERL_FILE_LOGGER_PATH", None)
+        if not metrics_path or not os.path.exists(metrics_path):
+            return
+
+        if local_global_step_folder is None:
+            local_global_step_folder = os.path.join(
+                self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
+            )
+
+        os.makedirs(local_global_step_folder, exist_ok=True)
+        metrics_snapshot_path = os.path.join(local_global_step_folder, "metrics.jsonl")
+
+        import shutil
+
+        shutil.copy2(metrics_path, metrics_snapshot_path)
+        logger.info(f"Saved metrics snapshot to {metrics_snapshot_path}")
+
     def _validate(self) -> dict[str, float]:
         # Lists to collect samples for the table
         sample_uids = []
@@ -1627,6 +1647,10 @@ class PPOTrainer:
                 self.replay_buffer.remove(batch.partition_id, batch.keys)
 
                 self.logger.log(data=metrics, step=self.global_steps)
+                if self.config.trainer.save_freq > 0 and (
+                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                ):
+                    self._snapshot_metrics_file()
                 progress_bar.update(1)
                 self.global_steps += 1
                 if is_last_step:

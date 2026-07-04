@@ -20,6 +20,8 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import json
+import os
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -48,6 +50,117 @@ PolicyLossFn = Callable[
 ]
 
 POLICY_LOSS_REGISTRY: dict[str, PolicyLossFn] = {}
+_PREFIX_CLIP_DIAG_CALL_COUNT = 0
+
+
+def _dump_prefix_clip_response_diagnostics(
+    *,
+    loss_name: str,
+    response_mask: torch.Tensor,
+    clipped: torch.Tensor,
+    lower_clipped: torch.Tensor,
+    prefix_avg_log_ratio: torch.Tensor,
+    eps_pos: torch.Tensor,
+    eps_neg: torch.Tensor,
+) -> None:
+    """Dump per-response prefix clipping diagnostics to a sidecar JSONL file.
+
+    The normal metrics path is shared by console/file/tensorboard loggers and
+    therefore should stay scalar-only. This sidecar keeps complete per-response
+    values for offline analysis without breaking TensorBoard.
+    """
+
+    if os.getenv("VERL_PREFIX_CLIP_DIAG_DISABLE", "0") == "1":
+        return
+
+    metrics_path = os.getenv("VERL_FILE_LOGGER_PATH")
+    diag_dir = os.getenv("VERL_PREFIX_CLIP_DIAG_DIR")
+    if diag_dir is None:
+        if not metrics_path:
+            return
+        diag_dir = os.path.join(os.path.dirname(metrics_path), "prefix_clip_diagnostics")
+
+    global _PREFIX_CLIP_DIAG_CALL_COUNT
+    _PREFIX_CLIP_DIAG_CALL_COUNT += 1
+
+    try:
+        os.makedirs(diag_dir, exist_ok=True)
+        pid = os.getpid()
+        path = os.path.join(diag_dir, f"{loss_name}_pid{pid}.jsonl")
+
+        with torch.no_grad():
+            mask = response_mask.bool()
+            lengths = response_mask.sum(dim=-1).clamp(min=1.0)
+            clipped_valid = clipped & mask
+            lower_clipped_valid = lower_clipped & mask
+            positions = torch.cumsum(response_mask, dim=-1)
+            rel_positions = (positions / lengths.unsqueeze(-1)).clamp(min=0.0, max=1.0)
+
+            clipped_count = clipped_valid.float().sum(dim=-1)
+            lower_clipped_count = lower_clipped_valid.float().sum(dim=-1)
+            any_clip = clipped_valid.any(dim=-1)
+            any_lower_clip = lower_clipped_valid.any(dim=-1)
+
+            clipped_rel = torch.where(clipped_valid, rel_positions, torch.zeros_like(rel_positions))
+            first_clip_rel = torch.where(
+                any_clip,
+                torch.where(clipped_valid, rel_positions, torch.full_like(rel_positions, 2.0)).min(dim=-1).values,
+                torch.full_like(lengths, -1.0),
+            )
+            last_clip_rel = torch.where(
+                any_clip,
+                clipped_rel.max(dim=-1).values,
+                torch.full_like(lengths, -1.0),
+            )
+            mean_clip_rel = torch.where(
+                any_clip,
+                clipped_rel.sum(dim=-1) / clipped_count.clamp(min=1.0),
+                torch.full_like(lengths, -1.0),
+            )
+
+            masked_prefix_abs = torch.where(mask, prefix_avg_log_ratio.detach().abs(), torch.zeros_like(prefix_avg_log_ratio))
+            masked_eps_pos = torch.where(mask, eps_pos.detach(), torch.zeros_like(eps_pos))
+            masked_eps_neg = torch.where(mask, eps_neg.detach(), torch.zeros_like(eps_neg))
+
+            payload: dict[str, Any] = {
+                "loss_name": loss_name,
+                "pid": pid,
+                "call_index": _PREFIX_CLIP_DIAG_CALL_COUNT,
+                "batch_size": int(response_mask.shape[0]),
+                "response_length": lengths.detach().cpu().to(torch.int64).tolist(),
+                "clipped_token_count": clipped_count.detach().cpu().to(torch.int64).tolist(),
+                "lower_clipped_token_count": lower_clipped_count.detach().cpu().to(torch.int64).tolist(),
+                "clip_token_fraction": (clipped_count / lengths).detach().cpu().tolist(),
+                "lower_clip_token_fraction": (lower_clipped_count / lengths).detach().cpu().tolist(),
+                "any_clip": any_clip.detach().cpu().to(torch.int64).tolist(),
+                "any_lower_clip": any_lower_clip.detach().cpu().to(torch.int64).tolist(),
+                "first_clip_rel_pos": first_clip_rel.detach().cpu().tolist(),
+                "last_clip_rel_pos": last_clip_rel.detach().cpu().tolist(),
+                "mean_clip_rel_pos": mean_clip_rel.detach().cpu().tolist(),
+                "avg_log_ratio_abs_mean": (
+                    masked_prefix_abs.sum(dim=-1) / lengths
+                ).detach().cpu().tolist(),
+                "eps_pos_mean": (masked_eps_pos.sum(dim=-1) / lengths).detach().cpu().tolist(),
+                "eps_neg_mean": (masked_eps_neg.sum(dim=-1) / lengths).detach().cpu().tolist(),
+            }
+
+            # Optional raw clipped-token positions. This can become very large
+            # for long responses, so keep it opt-in.
+            if os.getenv("VERL_PREFIX_CLIP_DIAG_FULL_POSITIONS", "0") == "1":
+                payload["clip_rel_positions"] = [
+                    rel_positions[row_idx][clipped_valid[row_idx]].detach().cpu().tolist()
+                    for row_idx in range(response_mask.shape[0])
+                ]
+                payload["lower_clip_rel_positions"] = [
+                    rel_positions[row_idx][lower_clipped_valid[row_idx]].detach().cpu().tolist()
+                    for row_idx in range(response_mask.shape[0])
+                ]
+
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    except Exception:
+        # Diagnostics must never affect training.
+        return
 
 
 def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:
@@ -1582,7 +1695,7 @@ def compute_policy_loss_gspo(
     log_seq_importance_ratio = log_prob - log_prob.detach() + negative_approx_kl_seq.detach().unsqueeze(-1)
     log_seq_importance_ratio = torch.clamp(log_seq_importance_ratio, max=10.0)  # clamp for numerical stability
 
-    # finaly exp() to remove log
+    # finally exp() to remove log
     seq_importance_ratio = torch.exp(log_seq_importance_ratio)
 
     pg_losses1 = -advantages * seq_importance_ratio
@@ -1608,6 +1721,955 @@ def compute_policy_loss_gspo(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    return pg_loss, pg_metrics
+
+
+@register_policy_loss("prefix_dynamic_clip")
+def compute_policy_loss_prefix_dynamic_clip(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """PPO-style loss with dynamic clipping on average prefix log-ratios.
+
+    Compared with GSPO, which uses one sequence-level geometric-mean ratio for
+    every token in a response, this loss uses a token-dependent prefix ratio:
+
+        r_pre,i,t(theta) =
+            exp((1 / t) * sum_{k <= t}
+                log pi_theta(o_i,k | q_i, o_i,<k)
+              - log pi_old(o_i,k | q_i, o_i,<k))
+
+    The clipped ratio is obtained by clipping the average prefix log-ratio in
+    log space. The clip boundary is token-position dependent: it starts from a
+    DAPO/GRPO-like wide token-level boundary at the first response token and
+    decays as 1/t to a GSPO-like narrow boundary at the last response token.
+
+    As in GSPO, the numerical importance-ratio value is detached from the
+    gradient path. The gradient is routed only through the current-token
+    log-probability:
+
+        log r_for_grad,i,t =
+            log pi_theta(o_i,t | q_i, o_i,<t)
+          - sg[log pi_theta(o_i,t | q_i, o_i,<t)]
+          + sg[log r_pre,i,t(theta)]
+
+    This keeps the forward value equal to the prefix ratio, while avoiding
+    repeated backpropagation through all earlier prefix tokens.
+    """
+
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+
+    policy_loss_cfg = config.policy_loss
+    eps_1_low = float(policy_loss_cfg.get("prefix_clip_first_low", 0.2))
+    eps_1_high = float(policy_loss_cfg.get("prefix_clip_first_high", 0.28))
+    eps_t_low = float(policy_loss_cfg.get("prefix_clip_final_low", 3e-4))
+    eps_t_high = float(policy_loss_cfg.get("prefix_clip_final_high", 4e-4))
+
+    negative_approx_kl = log_prob - old_log_prob
+
+    # compute token-level log-ratio:
+    # l_i,t(theta) =
+    #   log pi_theta(o_i,t | q_i, o_i,<t)
+    # - log pi_old(o_i,t | q_i, o_i,<t)
+    # Only response tokens should contribute to prefix statistics.
+    log_ratio = negative_approx_kl * response_mask
+
+    # compute average prefix log-ratio:
+    # z_i,t(theta) = (1 / t) * sum_{k <= t} l_i,k(theta)
+    #
+    # prefix_len is the valid response-token prefix length at each token
+    # position. Padding positions are clamped to one to avoid division by zero;
+    # they are masked out again in loss/metric aggregation.
+    prefix_len = torch.cumsum(response_mask, dim=-1).clamp(min=1.0)
+    prefix_log_ratio_sum = torch.cumsum(log_ratio, dim=-1)
+    prefix_avg_log_ratio = prefix_log_ratio_sum / prefix_len
+
+    # First-token boundaries are specified in ratio space, matching the usual
+    # asymmetric PPO/DAPO-style clip interval [1 - eps_low, 1 + eps_high].
+    # Convert them to positive log-space magnitudes so the actual interval is
+    # [-eps_1_neg, eps_1_pos].
+    eps_1_pos = torch.log(torch.tensor(1.0 + eps_1_high, device=log_prob.device, dtype=log_prob.dtype))
+    eps_1_neg = -torch.log(torch.tensor(1.0 - eps_1_low, device=log_prob.device, dtype=log_prob.dtype))
+
+    # Final-token boundaries follow the same ratio-space semantics as GSPO's
+    # clip interval [1 - eps_low, 1 + eps_high]. Convert them to positive
+    # log-space magnitudes before interpolating in log-ratio space.
+    eps_t_pos = torch.log(torch.tensor(1.0 + eps_t_high, device=log_prob.device, dtype=log_prob.dtype))
+    eps_t_neg = -torch.log(torch.tensor(1.0 - eps_t_low, device=log_prob.device, dtype=log_prob.dtype))
+
+    # Interpolate clip boundaries from the first-token boundary to the
+    # final-token boundary with normalized 1/t decay:
+    #
+    # lambda_t = (1/t - 1/T) / (1 - 1/T)
+    #
+    # Thus lambda_1 = 1 and lambda_T = 0. The response_mask multiplication keeps
+    # padding positions inert.
+    seq_len = response_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+    lambda_t = (1.0 / prefix_len - 1.0 / seq_len) / (1.0 - 1.0 / seq_len).clamp(min=1e-8)
+    lambda_t = lambda_t.clamp(min=0.0, max=1.0) * response_mask
+
+    eps_pos = eps_t_pos + (eps_1_pos - eps_t_pos) * lambda_t
+    eps_neg = eps_t_neg + (eps_1_neg - eps_t_neg) * lambda_t
+
+    # Clip the average prefix log-ratio in log space:
+    #
+    # z_clip,i,t = clamp(z_i,t, -eps_neg,i,t, eps_pos,i,t)
+    #
+    # The outer [-10, 10] clamp is only a numerical guard before exp().
+    prefix_avg_log_ratio = torch.clamp(prefix_avg_log_ratio, min=-10.0, max=10.0)
+    prefix_avg_log_ratio_clip = torch.minimum(torch.maximum(prefix_avg_log_ratio, -eps_neg), eps_pos)
+
+    # Route gradients through only the current-token log-probability, as in
+    # GSPO, while using the average prefix log-ratio as the detached numerical
+    # importance-ratio value. The clipped branch uses torch.clamp so out-of-bound
+    # samples stop contributing gradients in the clipped direction.
+    prefix_log_importance_ratio = log_prob - log_prob.detach() + prefix_avg_log_ratio.detach()
+    prefix_log_importance_ratio = torch.clamp(prefix_log_importance_ratio, min=-10.0, max=10.0)
+    prefix_log_importance_ratio_clip = torch.minimum(torch.maximum(prefix_log_importance_ratio, -eps_neg), eps_pos)
+
+    ratio_for_loss = torch.exp(prefix_log_importance_ratio)
+    ratio_clip_for_loss = torch.exp(prefix_log_importance_ratio_clip)
+
+    pg_losses1 = -advantages * ratio_for_loss
+    pg_losses2 = -advantages * ratio_clip_for_loss
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    # Match the GSPO baseline aggregation so the experiment only changes the
+    # importance-ratio clipping rule.
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode="seq-mean-token-mean",
+        **config.global_batch_info,
+    )
+
+    clipped = torch.ne(prefix_avg_log_ratio, prefix_avg_log_ratio_clip)
+    lower_clipped = clipped & (prefix_avg_log_ratio < -eps_neg)
+    pg_clipfrac = verl_F.masked_mean(clipped.float(), response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean(lower_clipped.float(), response_mask)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    _dump_prefix_clip_response_diagnostics(
+        loss_name="prefix_dynamic_clip",
+        response_mask=response_mask,
+        clipped=clipped,
+        lower_clipped=lower_clipped,
+        prefix_avg_log_ratio=prefix_avg_log_ratio,
+        eps_pos=eps_pos,
+        eps_neg=eps_neg,
+    )
+
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        "actor/prefix_clip/eps_first_low": eps_1_low,
+        "actor/prefix_clip/eps_first_high": eps_1_high,
+        "actor/prefix_clip/eps_final_low": eps_t_low,
+        "actor/prefix_clip/eps_final_high": eps_t_high,
+        "actor/prefix_clip/avg_log_ratio_mean": verl_F.masked_mean(prefix_avg_log_ratio.detach(), response_mask).item(),
+        "actor/prefix_clip/avg_log_ratio_abs_mean": verl_F.masked_mean(
+            prefix_avg_log_ratio.detach().abs(), response_mask
+        ).item(),
+    }
+
+    # Diagnostics only: where does prefix clipping happen along the response?
+    #
+    # Buckets are based on normalized response position t / T. These metrics
+    # help distinguish "middle tokens are over-constrained" from "only the
+    # final segment approaches the GSPO-like endpoint bound".
+    relative_pos = (prefix_len / seq_len).clamp(min=0.0, max=1.0)
+    valid_response_mask = response_mask.bool()
+    for bucket_idx in range(10):
+        left = bucket_idx / 10.0
+        right = (bucket_idx + 1) / 10.0
+        if bucket_idx == 0:
+            bucket_mask = valid_response_mask & (relative_pos >= left) & (relative_pos <= right)
+        else:
+            bucket_mask = valid_response_mask & (relative_pos > left) & (relative_pos <= right)
+        bucket_mask_float = bucket_mask.float()
+        bucket_prefix = f"actor/prefix_clip/pos_bucket_{bucket_idx:02d}_{bucket_idx + 1:02d}"
+        pg_metrics[f"{bucket_prefix}/token_frac"] = verl_F.masked_mean(
+            bucket_mask_float, response_mask
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/pg_clipfrac"] = verl_F.masked_mean(
+            clipped.float(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/pg_clipfrac_lower"] = verl_F.masked_mean(
+            lower_clipped.float(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/avg_log_ratio_abs_mean"] = verl_F.masked_mean(
+            prefix_avg_log_ratio.detach().abs(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/eps_pos_mean"] = verl_F.masked_mean(
+            eps_pos.detach(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/eps_neg_mean"] = verl_F.masked_mean(
+            eps_neg.detach(), bucket_mask_float
+        ).detach().item()
+
+    # Diagnostics only: do shorter and longer responses experience different
+    # clipping pressure? For each response-length bucket, record both token-level
+    # clip fraction and sequence-level "any token clipped" fraction.
+    seq_len_flat = seq_len.squeeze(-1)
+    clipped_valid = clipped & valid_response_mask
+    clipped_lower_valid = clipped_valid & (prefix_avg_log_ratio < -eps_neg)
+    length_buckets = [
+        (0, 1024, "00000_01024"),
+        (1024, 2048, "01024_02048"),
+        (2048, 4096, "02048_04096"),
+        (4096, 8192, "04096_08192"),
+        (8192, 12288, "08192_12288"),
+        (12288, 16000, "12288_16000"),
+        (16000, None, "16000_plus"),
+    ]
+    for lower, upper, label in length_buckets:
+        if upper is None:
+            seq_bucket_mask = seq_len_flat >= lower
+        else:
+            seq_bucket_mask = (seq_len_flat >= lower) & (seq_len_flat < upper)
+        seq_bucket_mask_float = seq_bucket_mask.float()
+        token_bucket_mask = valid_response_mask & seq_bucket_mask.unsqueeze(-1)
+        token_bucket_mask_float = token_bucket_mask.float()
+        seq_bucket_denom = seq_bucket_mask_float.sum().clamp(min=1.0)
+        len_prefix = f"actor/prefix_clip/response_len_bucket_{label}"
+        pg_metrics[f"{len_prefix}/response_frac"] = seq_bucket_mask_float.mean().detach().item()
+        pg_metrics[f"{len_prefix}/token_frac"] = verl_F.masked_mean(
+            token_bucket_mask_float, response_mask
+        ).detach().item()
+        pg_metrics[f"{len_prefix}/response_len_mean"] = (
+            (seq_len_flat.detach() * seq_bucket_mask_float).sum() / seq_bucket_denom
+        ).item()
+        pg_metrics[f"{len_prefix}/token_pg_clipfrac"] = verl_F.masked_mean(
+            clipped.float(), token_bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{len_prefix}/token_pg_clipfrac_lower"] = verl_F.masked_mean(
+            clipped_lower_valid.float(), token_bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{len_prefix}/response_any_clipfrac"] = (
+            (clipped_valid.any(dim=-1).float() * seq_bucket_mask_float).sum() / seq_bucket_denom
+        ).detach().item()
+        pg_metrics[f"{len_prefix}/response_any_lower_clipfrac"] = (
+            (clipped_lower_valid.any(dim=-1).float() * seq_bucket_mask_float).sum() / seq_bucket_denom
+        ).detach().item()
+    return pg_loss, pg_metrics
+
+
+@register_policy_loss("prefix_ripo_clip")
+def compute_policy_loss_prefix_ripo_clip(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Average-prefix surrogate with RIPO-like prefix likelihood-ratio clipping.
+
+    This variant keeps the same surrogate semantics as ``prefix_dynamic_clip``:
+    the forward importance ratio for token ``t`` is the average prefix ratio
+
+        r_pre,i,t = exp((1 / t) * sum_{k <= t} log r_i,k),
+
+    and the gradient is locked to the current token as in GSPO. The only change
+    is the clipping rule. Instead of prescribing a position-only schedule for
+    the average prefix log-ratio, it follows the RIPO-like section of the design
+    note and clips the prefix likelihood ratio
+
+        R_pre,i,t = exp(L_i,t),  L_i,t = sum_{k <= t} log r_i,k,
+
+    with a per-prefix coordinate bound determined by the old-policy prefix
+    probability:
+
+        0.5 * pi_old(o_i,<=t | q) * (R_pre,i,t - 1)^2 <= delta.
+
+    In log space this gives
+
+        L_i,t <= log(1 + sqrt(2 * delta_high / pi_old_prefix))
+
+    and, when the lower bound is positive,
+
+        L_i,t >= log(1 - sqrt(2 * delta_low / pi_old_prefix)).
+
+    The clipped likelihood-ratio bound is converted back to the average-prefix
+    ratio by dividing by the prefix length before exponentiation.
+    """
+
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+
+    policy_loss_cfg = config.policy_loss
+    delta_low = float(policy_loss_cfg.get("prefix_ripo_delta_low", 0.05))
+    delta_high = float(policy_loss_cfg.get("prefix_ripo_delta_high", 0.05))
+    if delta_low <= 0.0 or delta_high <= 0.0:
+        raise ValueError("prefix_ripo_delta_low/high must both be positive.")
+
+    negative_approx_kl = log_prob - old_log_prob
+    log_ratio = negative_approx_kl * response_mask
+
+    prefix_len = torch.cumsum(response_mask, dim=-1).clamp(min=1.0)
+    prefix_log_ratio_sum = torch.cumsum(log_ratio, dim=-1)
+    prefix_avg_log_ratio = prefix_log_ratio_sum / prefix_len
+
+    # log pi_old(o_i,<=t | q) = sum_{k <= t} log pi_old(o_i,k | q,o_i,<k).
+    # Padding positions are inert because response_mask zeros them before cumsum.
+    old_prefix_log_prob = torch.cumsum(old_log_prob * response_mask, dim=-1)
+
+    log_2_delta_high = torch.tensor(
+        np.log(2.0 * delta_high), device=log_prob.device, dtype=log_prob.dtype
+    )
+    log_2_delta_low = torch.tensor(
+        np.log(2.0 * delta_low), device=log_prob.device, dtype=log_prob.dtype
+    )
+
+    # stable log(1 + sqrt(2 * delta_high / pi_old_prefix)).
+    high_radius_log = 0.5 * (log_2_delta_high - old_prefix_log_prob)
+    upper_log_bound = torch.logaddexp(torch.zeros_like(high_radius_log), high_radius_log)
+
+    # lower bound is active only when 1 - sqrt(2 * delta_low / pi_old_prefix) > 0.
+    low_radius = torch.exp(torch.clamp(0.5 * (log_2_delta_low - old_prefix_log_prob), max=80.0))
+    lower_ratio_bound = 1.0 - low_radius
+    lower_active = lower_ratio_bound > 0.0
+    neg_inf = torch.full_like(lower_ratio_bound, -torch.inf)
+    lower_log_bound = torch.where(
+        lower_active,
+        torch.log(torch.clamp(lower_ratio_bound, min=torch.finfo(log_prob.dtype).tiny)),
+        neg_inf,
+    )
+
+    # Clip prefix cumulative log-ratio L_i,t, then convert the clipped likelihood
+    # ratio back into the average-prefix ratio used by the surrogate.
+    prefix_log_ratio_sum = torch.clamp(prefix_log_ratio_sum, min=-80.0, max=80.0)
+    prefix_log_ratio_sum_clip = torch.minimum(torch.maximum(prefix_log_ratio_sum, lower_log_bound), upper_log_bound)
+    prefix_avg_log_ratio_clip = prefix_log_ratio_sum_clip / prefix_len
+
+    # Gradient locking follows GSPO/prefix_dynamic_clip: the numerical ratio is
+    # detached prefix information, while gradients flow through the current
+    # token log-probability only. The clipped branch clamps the token-gradient
+    # expression so clipped samples stop contributing in the clipped direction.
+    lower_avg_log_bound = lower_log_bound / prefix_len
+    upper_avg_log_bound = upper_log_bound / prefix_len
+    prefix_log_importance_ratio = log_prob - log_prob.detach() + prefix_avg_log_ratio.detach()
+    prefix_log_importance_ratio = torch.clamp(prefix_log_importance_ratio, min=-10.0, max=10.0)
+    prefix_log_importance_ratio_clip = torch.minimum(
+        torch.maximum(prefix_log_importance_ratio, lower_avg_log_bound), upper_avg_log_bound
+    )
+    prefix_log_importance_ratio_clip = torch.clamp(prefix_log_importance_ratio_clip, min=-10.0, max=10.0)
+
+    ratio_for_loss = torch.exp(prefix_log_importance_ratio)
+    ratio_clip_for_loss = torch.exp(prefix_log_importance_ratio_clip)
+
+    pg_losses1 = -advantages * ratio_for_loss
+    pg_losses2 = -advantages * ratio_clip_for_loss
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode="seq-mean-token-mean",
+        **config.global_batch_info,
+    )
+
+    clipped = torch.ne(prefix_log_ratio_sum, prefix_log_ratio_sum_clip)
+    lower_clipped = clipped & (prefix_log_ratio_sum < lower_log_bound)
+    pg_clipfrac = verl_F.masked_mean(clipped.float(), response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean(lower_clipped.float(), response_mask)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    lower_active_float = lower_active.float()
+    upper_avg_log_bound_detached = upper_avg_log_bound.detach()
+    finite_lower_avg_log_bound = torch.where(
+        lower_active, lower_avg_log_bound.detach(), torch.zeros_like(lower_avg_log_bound)
+    )
+    response_mask_float = response_mask
+    lower_active_count = (lower_active_float * response_mask_float).sum().clamp(min=1.0)
+
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        "actor/prefix_ripo_clip/delta_low": delta_low,
+        "actor/prefix_ripo_clip/delta_high": delta_high,
+        "actor/prefix_ripo_clip/avg_log_ratio_mean": verl_F.masked_mean(
+            prefix_avg_log_ratio.detach(), response_mask
+        ).item(),
+        "actor/prefix_ripo_clip/avg_log_ratio_abs_mean": verl_F.masked_mean(
+            prefix_avg_log_ratio.detach().abs(), response_mask
+        ).item(),
+        "actor/prefix_ripo_clip/sum_log_ratio_abs_mean": verl_F.masked_mean(
+            prefix_log_ratio_sum.detach().abs(), response_mask
+        ).item(),
+        "actor/prefix_ripo_clip/upper_avg_log_bound_mean": verl_F.masked_mean(
+            upper_avg_log_bound_detached, response_mask
+        ).item(),
+        "actor/prefix_ripo_clip/lower_bound_active_frac": verl_F.masked_mean(
+            lower_active_float, response_mask
+        ).item(),
+        "actor/prefix_ripo_clip/lower_avg_log_bound_active_mean": (
+            (finite_lower_avg_log_bound * lower_active_float * response_mask_float).sum() / lower_active_count
+        )
+        .detach()
+        .item(),
+    }
+
+    relative_pos = (prefix_len / response_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)).clamp(min=0.0, max=1.0)
+    valid_response_mask = response_mask.bool()
+    for bucket_idx in range(10):
+        left = bucket_idx / 10.0
+        right = (bucket_idx + 1) / 10.0
+        if bucket_idx == 0:
+            bucket_mask = valid_response_mask & (relative_pos >= left) & (relative_pos <= right)
+        else:
+            bucket_mask = valid_response_mask & (relative_pos > left) & (relative_pos <= right)
+        bucket_mask_float = bucket_mask.float()
+        bucket_prefix = f"actor/prefix_ripo_clip/pos_bucket_{bucket_idx:02d}_{bucket_idx + 1:02d}"
+        pg_metrics[f"{bucket_prefix}/token_frac"] = verl_F.masked_mean(
+            bucket_mask_float, response_mask
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/pg_clipfrac"] = verl_F.masked_mean(
+            clipped.float(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/pg_clipfrac_lower"] = verl_F.masked_mean(
+            lower_clipped.float(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/avg_log_ratio_abs_mean"] = verl_F.masked_mean(
+            prefix_avg_log_ratio.detach().abs(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/sum_log_ratio_abs_mean"] = verl_F.masked_mean(
+            prefix_log_ratio_sum.detach().abs(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/upper_avg_log_bound_mean"] = verl_F.masked_mean(
+            upper_avg_log_bound_detached, bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/lower_bound_active_frac"] = verl_F.masked_mean(
+            lower_active_float, bucket_mask_float
+        ).detach().item()
+
+    return pg_loss, pg_metrics
+
+
+@register_policy_loss("prefix_sqrt_dynamic_clip")
+def compute_policy_loss_prefix_sqrt_dynamic_clip(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Average-prefix PPO-style loss with sqrt-position dynamic clipping.
+
+    This is intentionally the same surrogate as ``prefix_dynamic_clip``: the
+    numerical ratio is the detached average prefix ratio and gradients are
+    routed only through the current-token log-probability. The only algorithmic
+    change is the boundary schedule:
+
+        lambda_t = (t^{-1/2} - T^{-1/2}) / (1 - T^{-1/2})
+
+    instead of the original normalized 1/t schedule. This treats the prefix
+    cumulative log-ratio as a sum of token-level increments whose natural scale
+    grows like sqrt(t), so the average prefix log-ratio bound decays like
+    1/sqrt(t) between the first-token and final-token endpoints.
+    """
+
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+
+    policy_loss_cfg = config.policy_loss
+    eps_1_low = float(policy_loss_cfg.get("prefix_clip_first_low", 0.2))
+    eps_1_high = float(policy_loss_cfg.get("prefix_clip_first_high", 0.28))
+    eps_t_low = float(policy_loss_cfg.get("prefix_clip_final_low", 3e-4))
+    eps_t_high = float(policy_loss_cfg.get("prefix_clip_final_high", 4e-4))
+
+    negative_approx_kl = log_prob - old_log_prob
+    log_ratio = negative_approx_kl * response_mask
+
+    prefix_len = torch.cumsum(response_mask, dim=-1).clamp(min=1.0)
+    prefix_log_ratio_sum = torch.cumsum(log_ratio, dim=-1)
+    prefix_avg_log_ratio = prefix_log_ratio_sum / prefix_len
+
+    eps_1_pos = torch.log(torch.tensor(1.0 + eps_1_high, device=log_prob.device, dtype=log_prob.dtype))
+    eps_1_neg = -torch.log(torch.tensor(1.0 - eps_1_low, device=log_prob.device, dtype=log_prob.dtype))
+    eps_t_pos = torch.log(torch.tensor(1.0 + eps_t_high, device=log_prob.device, dtype=log_prob.dtype))
+    eps_t_neg = -torch.log(torch.tensor(1.0 - eps_t_low, device=log_prob.device, dtype=log_prob.dtype))
+
+    seq_len = response_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+    sqrt_prefix_len = torch.sqrt(prefix_len)
+    sqrt_seq_len = torch.sqrt(seq_len)
+    lambda_t = (1.0 / sqrt_prefix_len - 1.0 / sqrt_seq_len) / (1.0 - 1.0 / sqrt_seq_len).clamp(min=1e-8)
+    lambda_t = lambda_t.clamp(min=0.0, max=1.0) * response_mask
+
+    eps_pos = eps_t_pos + (eps_1_pos - eps_t_pos) * lambda_t
+    eps_neg = eps_t_neg + (eps_1_neg - eps_t_neg) * lambda_t
+
+    prefix_avg_log_ratio = torch.clamp(prefix_avg_log_ratio, min=-10.0, max=10.0)
+    prefix_avg_log_ratio_clip = torch.minimum(torch.maximum(prefix_avg_log_ratio, -eps_neg), eps_pos)
+
+    prefix_log_importance_ratio = log_prob - log_prob.detach() + prefix_avg_log_ratio.detach()
+    prefix_log_importance_ratio = torch.clamp(prefix_log_importance_ratio, min=-10.0, max=10.0)
+    prefix_log_importance_ratio_clip = torch.minimum(torch.maximum(prefix_log_importance_ratio, -eps_neg), eps_pos)
+
+    ratio_for_loss = torch.exp(prefix_log_importance_ratio)
+    ratio_clip_for_loss = torch.exp(prefix_log_importance_ratio_clip)
+
+    pg_losses1 = -advantages * ratio_for_loss
+    pg_losses2 = -advantages * ratio_clip_for_loss
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode="seq-mean-token-mean",
+        **config.global_batch_info,
+    )
+
+    clipped = torch.ne(prefix_avg_log_ratio, prefix_avg_log_ratio_clip)
+    pg_clipfrac = verl_F.masked_mean(clipped.float(), response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean((clipped & (prefix_avg_log_ratio < -eps_neg)).float(), response_mask)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        "actor/prefix_sqrt_clip/eps_first_low": eps_1_low,
+        "actor/prefix_sqrt_clip/eps_first_high": eps_1_high,
+        "actor/prefix_sqrt_clip/eps_final_low": eps_t_low,
+        "actor/prefix_sqrt_clip/eps_final_high": eps_t_high,
+        "actor/prefix_sqrt_clip/avg_log_ratio_mean": verl_F.masked_mean(
+            prefix_avg_log_ratio.detach(), response_mask
+        ).item(),
+        "actor/prefix_sqrt_clip/avg_log_ratio_abs_mean": verl_F.masked_mean(
+            prefix_avg_log_ratio.detach().abs(), response_mask
+        ).item(),
+        "actor/prefix_sqrt_clip/eps_pos_mean": verl_F.masked_mean(eps_pos.detach(), response_mask).item(),
+        "actor/prefix_sqrt_clip/eps_neg_mean": verl_F.masked_mean(eps_neg.detach(), response_mask).item(),
+        "actor/prefix_sqrt_clip/lambda_mean": verl_F.masked_mean(lambda_t.detach(), response_mask).item(),
+    }
+
+    relative_pos = (prefix_len / seq_len).clamp(min=0.0, max=1.0)
+    valid_response_mask = response_mask.bool()
+    for bucket_idx in range(10):
+        left = bucket_idx / 10.0
+        right = (bucket_idx + 1) / 10.0
+        if bucket_idx == 0:
+            bucket_mask = valid_response_mask & (relative_pos >= left) & (relative_pos <= right)
+        else:
+            bucket_mask = valid_response_mask & (relative_pos > left) & (relative_pos <= right)
+        bucket_mask_float = bucket_mask.float()
+        bucket_prefix = f"actor/prefix_sqrt_clip/pos_bucket_{bucket_idx:02d}_{bucket_idx + 1:02d}"
+        pg_metrics[f"{bucket_prefix}/token_frac"] = verl_F.masked_mean(
+            bucket_mask_float, response_mask
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/pg_clipfrac"] = verl_F.masked_mean(
+            clipped.float(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/avg_log_ratio_abs_mean"] = verl_F.masked_mean(
+            prefix_avg_log_ratio.detach().abs(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/eps_pos_mean"] = verl_F.masked_mean(
+            eps_pos.detach(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/eps_neg_mean"] = verl_F.masked_mean(
+            eps_neg.detach(), bucket_mask_float
+        ).detach().item()
+
+    return pg_loss, pg_metrics
+
+
+@register_policy_loss("prefix_sum_dynamic_clip")
+def compute_policy_loss_prefix_sum_dynamic_clip(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """PPO-style loss with dynamic clipping on prefix likelihood ratios.
+
+    This variant uses the prefix cumulative log-ratio directly:
+
+        L_i,t(theta) = sum_{k <= t}
+            log pi_theta(o_i,k | q_i, o_i,<k)
+          - log pi_old(o_i,k | q_i, o_i,<k)
+
+    Therefore the numerical importance-ratio value is the prefix likelihood
+    ratio exp(L_i,t), rather than the average-prefix ratio exp(L_i,t / t). To
+    keep this sum-log-ratio parameterization on the same trust-region scale as
+    average-prefix clipping, the average log-space boundary is multiplied by the
+    prefix length t and then capped by alpha:
+
+        B_i,t^+ = min(t * eps_i,t^+, alpha)
+        B_i,t^- = min(t * eps_i,t^-, alpha)
+
+    The alpha cap is applied in log space before exp(), so alpha=2 constrains
+    the usable prefix likelihood ratio to approximately [exp(-2), exp(2)]. As
+    in GSPO, gradients are routed only through the current-token log-probability.
+    """
+
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+
+    policy_loss_cfg = config.policy_loss
+    eps_1_low = float(policy_loss_cfg.get("prefix_clip_first_low", 0.2))
+    eps_1_high = float(policy_loss_cfg.get("prefix_clip_first_high", 0.28))
+    eps_t_low = float(policy_loss_cfg.get("prefix_clip_final_low", 3e-4))
+    eps_t_high = float(policy_loss_cfg.get("prefix_clip_final_high", 4e-4))
+    alpha = float(policy_loss_cfg.get("prefix_clip_sum_alpha", 2.0))
+
+    negative_approx_kl = log_prob - old_log_prob
+
+    # token-level log-ratio l_i,t(theta), masked to response tokens only.
+    log_ratio = negative_approx_kl * response_mask
+
+    # prefix cumulative log-ratio L_i,t(theta) = sum_{k <= t} l_i,k(theta).
+    prefix_len = torch.cumsum(response_mask, dim=-1).clamp(min=1.0)
+    prefix_log_ratio_sum = torch.cumsum(log_ratio, dim=-1)
+
+    # Reuse the average-prefix dynamic schedule, then convert its boundary to
+    # the sum-log-ratio scale by multiplying with prefix_len.
+    eps_1_pos = torch.log(torch.tensor(1.0 + eps_1_high, device=log_prob.device, dtype=log_prob.dtype))
+    eps_1_neg = -torch.log(torch.tensor(1.0 - eps_1_low, device=log_prob.device, dtype=log_prob.dtype))
+    eps_t_pos = torch.log(torch.tensor(1.0 + eps_t_high, device=log_prob.device, dtype=log_prob.dtype))
+    eps_t_neg = -torch.log(torch.tensor(1.0 - eps_t_low, device=log_prob.device, dtype=log_prob.dtype))
+
+    seq_len = response_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+    lambda_t = (1.0 / prefix_len - 1.0 / seq_len) / (1.0 - 1.0 / seq_len).clamp(min=1e-8)
+    lambda_t = lambda_t.clamp(min=0.0, max=1.0) * response_mask
+
+    avg_eps_pos = eps_t_pos + (eps_1_pos - eps_t_pos) * lambda_t
+    avg_eps_neg = eps_t_neg + (eps_1_neg - eps_t_neg) * lambda_t
+
+    alpha_tensor = torch.tensor(alpha, device=log_prob.device, dtype=log_prob.dtype)
+    sum_eps_pos = torch.minimum(prefix_len * avg_eps_pos, alpha_tensor)
+    sum_eps_neg = torch.minimum(prefix_len * avg_eps_neg, alpha_tensor)
+
+    # Numerical guard for prefix likelihood ratios. This is the sum-log-ratio
+    # value used by the unclipped surrogate branch.
+    prefix_sum_log_ratio = torch.clamp(prefix_log_ratio_sum, min=-alpha, max=alpha)
+    prefix_sum_log_ratio_clip = torch.minimum(torch.maximum(prefix_sum_log_ratio, -sum_eps_neg), sum_eps_pos)
+
+    # Stop-gradient trick: forward value equals prefix_sum_log_ratio, but the
+    # gradient enters only through the current token log-probability. The clipped
+    # branch keeps clamp's zero-gradient behavior outside the active interval.
+    prefix_log_importance_ratio = log_prob - log_prob.detach() + prefix_sum_log_ratio.detach()
+    prefix_log_importance_ratio = torch.clamp(prefix_log_importance_ratio, min=-alpha, max=alpha)
+    prefix_log_importance_ratio_clip = torch.minimum(torch.maximum(prefix_log_importance_ratio, -sum_eps_neg), sum_eps_pos)
+
+    ratio_for_loss = torch.exp(prefix_log_importance_ratio)
+    ratio_clip_for_loss = torch.exp(prefix_log_importance_ratio_clip)
+
+    pg_losses1 = -advantages * ratio_for_loss
+    pg_losses2 = -advantages * ratio_clip_for_loss
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode="seq-mean-token-mean",
+        **config.global_batch_info,
+    )
+
+    clipped = torch.ne(prefix_sum_log_ratio, prefix_sum_log_ratio_clip)
+    pg_clipfrac = verl_F.masked_mean(clipped.float(), response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean((clipped & (prefix_sum_log_ratio < -sum_eps_neg)).float(), response_mask)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        "actor/prefix_sum_clip/alpha": alpha,
+        "actor/prefix_sum_clip/eps_first_low": eps_1_low,
+        "actor/prefix_sum_clip/eps_first_high": eps_1_high,
+        "actor/prefix_sum_clip/eps_final_low": eps_t_low,
+        "actor/prefix_sum_clip/eps_final_high": eps_t_high,
+        "actor/prefix_sum_clip/log_ratio_mean": verl_F.masked_mean(prefix_sum_log_ratio.detach(), response_mask).item(),
+        "actor/prefix_sum_clip/log_ratio_abs_mean": verl_F.masked_mean(
+            prefix_sum_log_ratio.detach().abs(), response_mask
+        ).item(),
+        "actor/prefix_sum_clip/bound_pos_mean": verl_F.masked_mean(sum_eps_pos.detach(), response_mask).item(),
+        "actor/prefix_sum_clip/bound_neg_mean": verl_F.masked_mean(sum_eps_neg.detach(), response_mask).item(),
+    }
+    return pg_loss, pg_metrics
+
+
+@register_policy_loss("prefix_sum_gate_avg_clip")
+def compute_policy_loss_prefix_sum_gate_avg_clip(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Average-prefix ratio loss with prefix-sum clipping gates.
+
+    This variant is a GSPO-style stop-gradient policy loss that uses a
+    token-dependent prefix ratio instead of one sequence-level ratio for every
+    token. Let
+
+        l_i,t(theta) =
+            log pi_theta(o_i,t | q_i, o_i,<t)
+          - log pi_old(o_i,t | q_i, o_i,<t)
+
+    be the token-level log-ratio, and let
+
+        L_i,t(theta) = sum_{k <= t} l_i,k(theta)
+        z_i,t(theta) = L_i,t(theta) / t
+
+    be the cumulative prefix log-ratio and average-prefix log-ratio. The
+    numerical importance ratio used by the surrogate remains the stable
+    average-prefix ratio exp(z_i,t). Clipping, however, is decided on the prefix
+    likelihood-ratio scale exp(L_i,t). We first construct a sum-log-ratio bound
+
+        B_i,t^+ = min(t * eps_i,t^+, alpha)
+        B_i,t^- = min(t * eps_i,t^-, alpha)
+
+    and then convert it back to the average-log-ratio scale for the clipped
+    branch:
+
+        z_i,t = L_i,t / t
+        z_clip,i,t = clamp(z_i,t, -B_i,t^- / t, B_i,t^+ / t)
+
+    This preserves the stable average-prefix weighting while using the prefix
+    likelihood ratio exp(L_i,t) as the trust-region gate. Gradients are routed
+    only through the current-token log-probability, as in GSPO.
+
+    Args:
+        old_log_prob (torch.Tensor):
+            Log-probabilities of response tokens under the old policy, shape
+            (batch_size, response_length).
+        log_prob (torch.Tensor):
+            Log-probabilities of response tokens under the current policy,
+            shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates for each response token, shape
+            (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask indicating valid response tokens, shape
+            (batch_size, response_length).
+        loss_agg_mode (str, optional):
+            Unused here. This loss matches GSPO and aggregates with
+            "seq-mean-token-mean".
+    """
+
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+
+    policy_loss_cfg = config.policy_loss
+    eps_1_low = float(policy_loss_cfg.get("prefix_clip_first_low", 0.2))
+    eps_1_high = float(policy_loss_cfg.get("prefix_clip_first_high", 0.28))
+    eps_t_low = float(policy_loss_cfg.get("prefix_clip_final_low", 3e-4))
+    eps_t_high = float(policy_loss_cfg.get("prefix_clip_final_high", 4e-4))
+    alpha = float(policy_loss_cfg.get("prefix_clip_sum_alpha", 2.0))
+
+    # compute token-level log-ratio:
+    # l_i,t(theta) =
+    #   log pi_theta(o_i,t | q_i, o_i,<t)
+    # - log pi_old(o_i,t | q_i, o_i,<t)
+    negative_approx_kl = log_prob - old_log_prob
+
+    # Only response tokens should contribute to prefix statistics. Padding
+    # positions are masked out again in loss/metric aggregation.
+    log_ratio = negative_approx_kl * response_mask
+
+    # compute prefix statistics:
+    # L_i,t(theta) = sum_{k <= t} l_i,k(theta)
+    # z_i,t(theta) = L_i,t(theta) / t
+    #
+    # prefix_len is the valid response-token prefix length at each position.
+    # Padding positions are clamped to one to avoid division by zero.
+    prefix_len = torch.cumsum(response_mask, dim=-1).clamp(min=1.0)
+    prefix_log_ratio_sum = torch.cumsum(log_ratio, dim=-1)
+    prefix_avg_log_ratio = prefix_log_ratio_sum / prefix_len
+
+    # First-token boundaries are specified in ratio space, matching the usual
+    # asymmetric PPO/DAPO-style clip interval [1 - eps_low, 1 + eps_high].
+    # Convert them to positive log-space magnitudes so the actual interval is
+    # [-eps_1_neg, eps_1_pos].
+    eps_1_pos = torch.log(torch.tensor(1.0 + eps_1_high, device=log_prob.device, dtype=log_prob.dtype))
+    eps_1_neg = -torch.log(torch.tensor(1.0 - eps_1_low, device=log_prob.device, dtype=log_prob.dtype))
+
+    # Final-token boundaries follow the same ratio-space semantics as GSPO's
+    # clip interval [1 - eps_low, 1 + eps_high]. Convert them to positive
+    # log-space magnitudes before interpolating in log-ratio space.
+    eps_t_pos = torch.log(torch.tensor(1.0 + eps_t_high, device=log_prob.device, dtype=log_prob.dtype))
+    eps_t_neg = -torch.log(torch.tensor(1.0 - eps_t_low, device=log_prob.device, dtype=log_prob.dtype))
+
+    # Interpolate average-log-ratio clip boundaries from the first-token
+    # boundary to the final-token boundary with normalized 1/t decay:
+    #
+    # lambda_t = (1/t - 1/T) / (1 - 1/T)
+    #
+    # Thus lambda_1 = 1 and lambda_T = 0. The response_mask multiplication keeps
+    # padding positions inert.
+    seq_len = response_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+    lambda_t = (1.0 / prefix_len - 1.0 / seq_len) / (1.0 - 1.0 / seq_len).clamp(min=1e-8)
+    lambda_t = lambda_t.clamp(min=0.0, max=1.0) * response_mask
+
+    avg_eps_pos = eps_t_pos + (eps_1_pos - eps_t_pos) * lambda_t
+    avg_eps_neg = eps_t_neg + (eps_1_neg - eps_t_neg) * lambda_t
+
+    # Convert the average-log-ratio boundary to the prefix-sum scale:
+    #
+    # B_i,t^+ = min(t * eps_i,t^+, alpha)
+    # B_i,t^- = min(t * eps_i,t^-, alpha)
+    #
+    # alpha caps the prefix likelihood-ratio gate in log space. Dividing the
+    # capped bound by t maps it back to the average-prefix log-ratio scale used
+    # by the surrogate value.
+    alpha_tensor = torch.tensor(alpha, device=log_prob.device, dtype=log_prob.dtype)
+    sum_eps_pos = torch.minimum(prefix_len * avg_eps_pos, alpha_tensor)
+    sum_eps_neg = torch.minimum(prefix_len * avg_eps_neg, alpha_tensor)
+    gate_avg_eps_pos = sum_eps_pos / prefix_len
+    gate_avg_eps_neg = sum_eps_neg / prefix_len
+
+    # Clip the average-prefix log-ratio with bounds derived from the prefix-sum
+    # gate:
+    #
+    # z_clip,i,t = clamp(z_i,t, -B_i,t^- / t, B_i,t^+ / t)
+    #
+    # The outer [-10, 10] clamp is only a numerical guard before exp().
+    prefix_avg_log_ratio = torch.clamp(prefix_avg_log_ratio, min=-10.0, max=10.0)
+    prefix_avg_log_ratio_clip = torch.minimum(torch.maximum(prefix_avg_log_ratio, -gate_avg_eps_neg), gate_avg_eps_pos)
+
+    # Combined prefix ratio at token level:
+    # r_i,t(theta) = sg[exp(z_i,t(theta))]
+    #              * pi_theta(o_i,t | q_i, o_i,<t)
+    #              / sg[pi_theta(o_i,t | q_i, o_i,<t)]
+    #
+    # In log space:
+    # log r_i,t(theta) = log_prob - sg[log_prob] + sg[z_i,t(theta)]
+    #
+    # This keeps the forward value equal to exp(z_i,t), while routing gradients
+    # only through the current-token log-probability as in GSPO. The clipped
+    # branch keeps clamp's zero-gradient behavior outside the active interval.
+    prefix_log_importance_ratio = log_prob - log_prob.detach() + prefix_avg_log_ratio.detach()
+    prefix_log_importance_ratio = torch.clamp(prefix_log_importance_ratio, min=-10.0, max=10.0)
+    prefix_log_importance_ratio_clip = torch.minimum(
+        torch.maximum(prefix_log_importance_ratio, -gate_avg_eps_neg), gate_avg_eps_pos
+    )
+
+    # finaly exp() to remove log
+    ratio_for_loss = torch.exp(prefix_log_importance_ratio)
+    ratio_clip_for_loss = torch.exp(prefix_log_importance_ratio_clip)
+
+    pg_losses1 = -advantages * ratio_for_loss
+    pg_losses2 = -advantages * ratio_clip_for_loss
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    # Match the GSPO baseline aggregation so this variant changes only the
+    # importance-ratio and clipping rule.
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode="seq-mean-token-mean",
+        **config.global_batch_info,
+    )
+
+    # Metrics report both the average-ratio clipped fraction used by the loss
+    # and the prefix-sum gate clipped fraction used to diagnose trust-region
+    # pressure on exp(L_i,t).
+    sum_log_ratio_for_metrics = torch.clamp(prefix_log_ratio_sum, min=-alpha, max=alpha)
+    sum_log_ratio_clip_for_metrics = torch.minimum(torch.maximum(sum_log_ratio_for_metrics, -sum_eps_neg), sum_eps_pos)
+    clipped = torch.ne(prefix_avg_log_ratio, prefix_avg_log_ratio_clip)
+    sum_gate_clipped = torch.ne(sum_log_ratio_for_metrics, sum_log_ratio_clip_for_metrics)
+    pg_clipfrac = verl_F.masked_mean(clipped.float(), response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean((clipped & (prefix_avg_log_ratio < -gate_avg_eps_neg)).float(), response_mask)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        "actor/prefix_sum_gate_avg_clip/alpha": alpha,
+        "actor/prefix_sum_gate_avg_clip/eps_first_low": eps_1_low,
+        "actor/prefix_sum_gate_avg_clip/eps_first_high": eps_1_high,
+        "actor/prefix_sum_gate_avg_clip/eps_final_low": eps_t_low,
+        "actor/prefix_sum_gate_avg_clip/eps_final_high": eps_t_high,
+        "actor/prefix_sum_gate_avg_clip/avg_log_ratio_mean": verl_F.masked_mean(
+            prefix_avg_log_ratio.detach(), response_mask
+        ).item(),
+        "actor/prefix_sum_gate_avg_clip/avg_log_ratio_abs_mean": verl_F.masked_mean(
+            prefix_avg_log_ratio.detach().abs(), response_mask
+        ).item(),
+        "actor/prefix_sum_gate_avg_clip/sum_log_ratio_abs_mean": verl_F.masked_mean(
+            sum_log_ratio_for_metrics.detach().abs(), response_mask
+        ).item(),
+        "actor/prefix_sum_gate_avg_clip/sum_bound_pos_mean": verl_F.masked_mean(
+            sum_eps_pos.detach(), response_mask
+        ).item(),
+        "actor/prefix_sum_gate_avg_clip/sum_bound_neg_mean": verl_F.masked_mean(
+            sum_eps_neg.detach(), response_mask
+        ).item(),
+        "actor/prefix_sum_gate_avg_clip/sum_gate_clipfrac": verl_F.masked_mean(
+            sum_gate_clipped.float(), response_mask
+        ).item(),
+    }
+
+    # Position-bucket diagnostics for checking whether the dynamic prefix bound
+    # becomes too tight in the middle/end of long responses. These metrics do
+    # not affect the loss; they only expose where clipping happens along the
+    # normalized response position.
+    relative_pos = (prefix_len / seq_len).clamp(min=0.0, max=1.0)
+    valid_response_mask = response_mask.bool()
+    for bucket_idx in range(10):
+        left = bucket_idx / 10.0
+        right = (bucket_idx + 1) / 10.0
+        if bucket_idx == 0:
+            bucket_mask = valid_response_mask & (relative_pos >= left) & (relative_pos <= right)
+        else:
+            bucket_mask = valid_response_mask & (relative_pos > left) & (relative_pos <= right)
+        bucket_mask_float = bucket_mask.float()
+        bucket_prefix = f"actor/prefix_sum_gate_avg_clip/pos_bucket_{bucket_idx:02d}_{bucket_idx + 1:02d}"
+        pg_metrics[f"{bucket_prefix}/token_frac"] = verl_F.masked_mean(
+            bucket_mask_float, response_mask
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/pg_clipfrac"] = verl_F.masked_mean(
+            clipped.float(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/sum_gate_clipfrac"] = verl_F.masked_mean(
+            sum_gate_clipped.float(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/avg_log_ratio_abs_mean"] = verl_F.masked_mean(
+            prefix_avg_log_ratio.detach().abs(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/sum_log_ratio_abs_mean"] = verl_F.masked_mean(
+            sum_log_ratio_for_metrics.detach().abs(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/sum_bound_pos_mean"] = verl_F.masked_mean(
+            sum_eps_pos.detach(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/sum_bound_neg_mean"] = verl_F.masked_mean(
+            sum_eps_neg.detach(), bucket_mask_float
+        ).detach().item()
     return pg_loss, pg_metrics
 
 

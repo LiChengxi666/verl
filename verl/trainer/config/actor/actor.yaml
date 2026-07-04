@@ -75,6 +75,27 @@ policy_loss:
   # KL divergence penalty coefficient
   ppo_kl_coef: 0.1
 
+  # Lower clipping ratio for the first token in prefix dynamic clip
+  prefix_clip_first_low: 0.2
+
+  # Upper clipping ratio for the first token in prefix dynamic clip
+  prefix_clip_first_high: 0.28
+
+  # Lower log-space clipping boundary for the final token in prefix dynamic clip
+  prefix_clip_final_low: 3e-4
+
+  # Upper log-space clipping boundary for the final token in prefix dynamic clip
+  prefix_clip_final_high: 4e-4
+
+  # Log-space cap for prefix-sum likelihood-ratio clipping
+  prefix_clip_sum_alpha: 2.0
+
+  # RIPO-like lower trust-region budget for prefix RIPO clip
+  prefix_ripo_delta_low: 0.05
+
+  # RIPO-like upper trust-region budget for prefix RIPO clip
+  prefix_ripo_delta_high: 0.05
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 
@@ -314,4 +335,3 @@ qat:
 
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
-

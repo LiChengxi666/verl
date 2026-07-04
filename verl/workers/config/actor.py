@@ -96,6 +96,13 @@ class PolicyLossConfig(BaseConfig):
     clip_cov_ub: float = 5.0
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
+    prefix_clip_first_low: float = 0.2
+    prefix_clip_first_high: float = 0.28
+    prefix_clip_final_low: float = 3e-4
+    prefix_clip_final_high: float = 4e-4
+    prefix_clip_sum_alpha: float = 2.0
+    prefix_ripo_delta_low: float = 0.05
+    prefix_ripo_delta_high: float = 0.05
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
 
 
