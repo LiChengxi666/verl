@@ -4,7 +4,8 @@ set -xeuo pipefail
 # Portable single-node entrypoint for the Qwen3 math RL experiments.
 # This script intentionally does not depend on any platform-specific YAML.
 
-REPO_DIR="${REPO_DIR:-/GenSIvePFS/users/cxli/verl}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="${REPO_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 cd "${REPO_DIR}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
@@ -13,7 +14,7 @@ export MLP_WORKER_NUM="${MLP_WORKER_NUM:-1}"
 export MLP_WORKER_GPU="${MLP_WORKER_GPU:-8}"
 export MLP_WORKER_0_HOST="${MLP_WORKER_0_HOST:-127.0.0.1}"
 
-export MODEL_PATH="${MODEL_PATH:-/GenSIvePFS/users/cxli/models/Qwen3-4B-Base}"
+export MODEL_PATH="${MODEL_PATH:-${REPO_DIR}/models/Qwen3-4B-Base}"
 export TRAIN_FILE="${TRAIN_FILE:-${REPO_DIR}/data/data_processed/math-17k.parquet}"
 export VAL_FILE="${VAL_FILE:-${REPO_DIR}/data/data_processed/aime24.parquet}"
 
