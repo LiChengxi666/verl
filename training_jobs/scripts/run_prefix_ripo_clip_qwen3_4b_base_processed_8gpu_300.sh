@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-cd /GenSIvePFS/users/cxli/verl
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="${REPO_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+cd "${REPO_DIR}"
 # The verl:v0 image uses its built-in conda environment. Do not force .venv here.
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
@@ -9,6 +11,9 @@ export MLP_ROLE_INDEX="${MLP_ROLE_INDEX:-0}"
 export MLP_WORKER_NUM="${MLP_WORKER_NUM:-1}"
 export MLP_WORKER_GPU="${MLP_WORKER_GPU:-8}"
 export MLP_WORKER_0_HOST="${MLP_WORKER_0_HOST:-127.0.0.1}"
+export MODEL_PATH="${MODEL_PATH:-${REPO_DIR}/models/Qwen3-4B-Base}"
+export TRAIN_FILE="${TRAIN_FILE:-${REPO_DIR}/data/data_processed/math-17k.parquet}"
+export VAL_FILE="${VAL_FILE:-${REPO_DIR}/data/data_processed/aime24.parquet}"
 
 which python
 python - <<'PY'
@@ -25,14 +30,14 @@ print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
 print("MLP_WORKER_GPU:", os.environ.get("MLP_WORKER_GPU"))
 
 assert tensordict.__version__.split(".")[:2] >= ["0", "10"]
-assert verl.__file__.startswith("/GenSIvePFS/users/cxli/verl/"), verl.__file__
 assert int(os.environ["MLP_WORKER_GPU"]) == 8, "This script is configured for a single 8-GPU node."
 PY
 
 python - <<'PY'
+import os
 from transformers import AutoConfig, AutoTokenizer
 
-model_path = "/GenSIvePFS/users/cxli/models/Qwen3-4B-Base"
+model_path = os.environ["MODEL_PATH"]
 config = AutoConfig.from_pretrained(model_path, local_files_only=True, trust_remote_code=True)
 tok = AutoTokenizer.from_pretrained(model_path, local_files_only=True, trust_remote_code=True)
 print("MODEL_CHECK:", model_path, config.model_type, getattr(config, "num_hidden_layers", None), len(tok))
@@ -44,8 +49,6 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export VLLM_USE_V1=1
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
-export MODEL_PATH=/GenSIvePFS/users/cxli/models/Qwen3-4B-Base
-
 export PROJECT_NAME=verl_math_repro
 # RIPO-like deltas are average-token prefix KL budgets:
 #   D_KL^pre(t) <= t * delta.
@@ -55,9 +58,9 @@ export RIPO_DELTA_LOW="${RIPO_DELTA_LOW:-1e-5}"
 export RIPO_DELTA_HIGH="${RIPO_DELTA_HIGH:-3e-5}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-prefix-ripo-l1em5-h3em5-qwen3-4b-8gpu}"
 
-export CKPT_DIR=/GenSIvePFS/users/cxli/verl/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}
-export LOG_DIR=/GenSIvePFS/users/cxli/verl/train_logs/${PROJECT_NAME}/${EXPERIMENT_NAME}
-export VAL_DUMP_DIR=/GenSIvePFS/users/cxli/verl/validation_generations/${PROJECT_NAME}/${EXPERIMENT_NAME}
+export CKPT_DIR="${CKPT_DIR:-${REPO_DIR}/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
+export LOG_DIR="${LOG_DIR:-${REPO_DIR}/train_logs/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
+export VAL_DUMP_DIR="${VAL_DUMP_DIR:-${REPO_DIR}/validation_generations/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
 
 mkdir -p "${CKPT_DIR}" "${LOG_DIR}" "${VAL_DUMP_DIR}"
 
@@ -66,18 +69,22 @@ export VERL_PREFIX_CLIP_DIAG_DIR="${LOG_DIR}/prefix_clip_diagnostics"
 export TENSORBOARD_DIR="${LOG_DIR}/tensorboard"
 export TENSORBOARD_LOG_PATH="${TENSORBOARD_DIR}"
 export WANDB_DIR="${LOG_DIR}/wandb"
-export WANDB_MODE="${WANDB_MODE:-online}"
-export WANDB_RESUME="${WANDB_RESUME:-allow}"
-export WANDB_RUN_ID="${WANDB_RUN_ID:-${EXPERIMENT_NAME}}"
-export WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-/GenSIvePFS/users/cxli/.secrets/wandb_api_key}"
+export WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-${REPO_DIR}/.secrets/wandb_api_key}"
+USER_LOGGER_BACKENDS="${LOGGER_BACKENDS:-}"
+LOGGER_BACKENDS="${USER_LOGGER_BACKENDS:-[\"console\",\"file\",\"tensorboard\"]}"
 
-if [ -z "${WANDB_API_KEY:-}" ]; then
-  if [ ! -r "${WANDB_API_KEY_FILE}" ]; then
-    echo "WANDB_API_KEY is not set and ${WANDB_API_KEY_FILE} is not readable." >&2
-    exit 1
-  fi
+if [ -n "${WANDB_API_KEY:-}" ] || [ -r "${WANDB_API_KEY_FILE}" ]; then
   export WANDB_API_KEY
-  WANDB_API_KEY="$(tr -d '\r\n' < "${WANDB_API_KEY_FILE}")"
+  if [ -z "${WANDB_API_KEY:-}" ]; then
+    WANDB_API_KEY="$(tr -d '\r\n' < "${WANDB_API_KEY_FILE}")"
+  fi
+  export WANDB_ENTITY="${WANDB_ENTITY:-licx199}"
+  export WANDB_MODE="${WANDB_MODE:-online}"
+  export WANDB_RESUME="${WANDB_RESUME:-allow}"
+  export WANDB_RUN_ID="${WANDB_RUN_ID:-${EXPERIMENT_NAME}}"
+  if [ -z "${USER_LOGGER_BACKENDS}" ]; then
+    LOGGER_BACKENDS="[\"console\",\"file\",\"tensorboard\",\"wandb\"]"
+  fi
 fi
 
 mkdir -p "${WANDB_DIR}"
@@ -131,8 +138,8 @@ PY
   python -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
-    data.train_files=/GenSIvePFS/users/cxli/verl/data/data_processed/math-17k.parquet \
-    data.val_files=/GenSIvePFS/users/cxli/verl/data/data_processed/aime24.parquet \
+    data.train_files="${TRAIN_FILE}" \
+    data.val_files="${VAL_FILE}" \
     data.train_batch_size=128 \
     data.max_prompt_length=1024 \
     data.max_response_length=16384 \
@@ -180,7 +187,7 @@ PY
     +reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
     +reward.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward.reward_kwargs.max_resp_len=16384 \
-    trainer.logger='["console","file","tensorboard","wandb"]' \
+    trainer.logger="${LOGGER_BACKENDS}" \
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
     trainer.nnodes="${MLP_WORKER_NUM}" \

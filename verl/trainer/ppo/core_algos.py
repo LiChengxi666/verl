@@ -2093,9 +2093,21 @@ def compute_policy_loss_prefix_ripo_clip(
     pg_clipfrac = verl_F.masked_mean(clipped.float(), response_mask)
     pg_clipfrac_lower = verl_F.masked_mean(lower_clipped.float(), response_mask)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    upper_avg_log_bound_detached = upper_avg_log_bound.detach()
+    eps_pos = upper_avg_log_bound_detached
+    eps_neg = torch.where(lower_active, -lower_avg_log_bound.detach(), torch.zeros_like(lower_avg_log_bound))
+
+    _dump_prefix_clip_response_diagnostics(
+        loss_name="prefix_ripo_clip",
+        response_mask=response_mask,
+        clipped=clipped,
+        lower_clipped=lower_clipped,
+        prefix_avg_log_ratio=prefix_avg_log_ratio,
+        eps_pos=eps_pos,
+        eps_neg=eps_neg,
+    )
 
     lower_active_float = lower_active.float()
-    upper_avg_log_bound_detached = upper_avg_log_bound.detach()
     finite_lower_avg_log_bound = torch.where(
         lower_active, lower_avg_log_bound.detach(), torch.zeros_like(lower_avg_log_bound)
     )
@@ -2167,6 +2179,51 @@ def compute_policy_loss_prefix_ripo_clip(
         ).detach().item()
         pg_metrics[f"{bucket_prefix}/lower_bound_active_frac"] = verl_F.masked_mean(
             lower_active_float, bucket_mask_float
+        ).detach().item()
+
+    # Diagnostics only: record clipping pressure by full response length. This
+    # mirrors prefix_dynamic_clip and prefix_sqrt_dynamic_clip so RIPO-like runs
+    # can be compared in the same post-hoc length-vs-clip plots.
+    seq_len_flat = response_mask.sum(dim=-1)
+    clipped_valid = clipped & valid_response_mask
+    lower_clipped_valid = lower_clipped & valid_response_mask
+    length_buckets = [
+        (0, 1024, "00000_01024"),
+        (1024, 2048, "01024_02048"),
+        (2048, 4096, "02048_04096"),
+        (4096, 8192, "04096_08192"),
+        (8192, 12288, "08192_12288"),
+        (12288, 16000, "12288_16000"),
+        (16000, None, "16000_plus"),
+    ]
+    for lower, upper, label in length_buckets:
+        if upper is None:
+            seq_bucket_mask = seq_len_flat >= lower
+        else:
+            seq_bucket_mask = (seq_len_flat >= lower) & (seq_len_flat < upper)
+        seq_bucket_mask_float = seq_bucket_mask.float()
+        token_bucket_mask = valid_response_mask & seq_bucket_mask.unsqueeze(-1)
+        token_bucket_mask_float = token_bucket_mask.float()
+        seq_bucket_denom = seq_bucket_mask_float.sum().clamp(min=1.0)
+        len_prefix = f"actor/prefix_ripo_clip/response_len_bucket_{label}"
+        pg_metrics[f"{len_prefix}/response_frac"] = seq_bucket_mask_float.mean().detach().item()
+        pg_metrics[f"{len_prefix}/token_frac"] = verl_F.masked_mean(
+            token_bucket_mask_float, response_mask
+        ).detach().item()
+        pg_metrics[f"{len_prefix}/response_len_mean"] = (
+            (seq_len_flat.detach() * seq_bucket_mask_float).sum() / seq_bucket_denom
+        ).item()
+        pg_metrics[f"{len_prefix}/token_pg_clipfrac"] = verl_F.masked_mean(
+            clipped.float(), token_bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{len_prefix}/token_pg_clipfrac_lower"] = verl_F.masked_mean(
+            lower_clipped_valid.float(), token_bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{len_prefix}/response_any_clipfrac"] = (
+            (clipped_valid.any(dim=-1).float() * seq_bucket_mask_float).sum() / seq_bucket_denom
+        ).detach().item()
+        pg_metrics[f"{len_prefix}/response_any_lower_clipfrac"] = (
+            (lower_clipped_valid.any(dim=-1).float() * seq_bucket_mask_float).sum() / seq_bucket_denom
         ).detach().item()
 
     return pg_loss, pg_metrics
