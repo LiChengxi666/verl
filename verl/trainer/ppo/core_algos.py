@@ -1989,17 +1989,19 @@ def compute_policy_loss_prefix_ripo_clip(
         R_pre,i,t = exp(L_i,t),  L_i,t = sum_{k <= t} log r_i,k,
 
     with a per-prefix coordinate bound determined by the old-policy prefix
-    probability:
+    probability and a length-scaled prefix KL budget. Here
+    ``prefix_ripo_delta_low/high`` are average-token KL budgets, so the prefix
+    budget at length ``t`` is ``t * delta``:
 
-        0.5 * pi_old(o_i,<=t | q) * (R_pre,i,t - 1)^2 <= delta.
+        0.5 * pi_old(o_i,<=t | q) * (R_pre,i,t - 1)^2 <= t * delta.
 
     In log space this gives
 
-        L_i,t <= log(1 + sqrt(2 * delta_high / pi_old_prefix))
+        L_i,t <= log(1 + sqrt(2 * t * delta_high / pi_old_prefix))
 
     and, when the lower bound is positive,
 
-        L_i,t >= log(1 - sqrt(2 * delta_low / pi_old_prefix)).
+        L_i,t >= log(1 - sqrt(2 * t * delta_low / pi_old_prefix)).
 
     The clipped likelihood-ratio bound is converted back to the average-prefix
     ratio by dividing by the prefix length before exponentiation.
@@ -2009,8 +2011,8 @@ def compute_policy_loss_prefix_ripo_clip(
     assert isinstance(config, ActorConfig)
 
     policy_loss_cfg = config.policy_loss
-    delta_low = float(policy_loss_cfg.get("prefix_ripo_delta_low", 0.05))
-    delta_high = float(policy_loss_cfg.get("prefix_ripo_delta_high", 0.05))
+    delta_low = float(policy_loss_cfg.get("prefix_ripo_delta_low", 1e-5))
+    delta_high = float(policy_loss_cfg.get("prefix_ripo_delta_high", 3e-5))
     if delta_low <= 0.0 or delta_high <= 0.0:
         raise ValueError("prefix_ripo_delta_low/high must both be positive.")
 
@@ -2032,12 +2034,15 @@ def compute_policy_loss_prefix_ripo_clip(
         np.log(2.0 * delta_low), device=log_prob.device, dtype=log_prob.dtype
     )
 
-    # stable log(1 + sqrt(2 * delta_high / pi_old_prefix)).
-    high_radius_log = 0.5 * (log_2_delta_high - old_prefix_log_prob)
+    # stable log(1 + sqrt(2 * t * delta_high / pi_old_prefix)).
+    # prefix_len is t for valid response positions. Padding positions are
+    # ignored by response_mask downstream, so their bound values are inert.
+    log_prefix_len = torch.log(prefix_len)
+    high_radius_log = 0.5 * (log_2_delta_high + log_prefix_len - old_prefix_log_prob)
     upper_log_bound = torch.logaddexp(torch.zeros_like(high_radius_log), high_radius_log)
 
-    # lower bound is active only when 1 - sqrt(2 * delta_low / pi_old_prefix) > 0.
-    low_radius = torch.exp(torch.clamp(0.5 * (log_2_delta_low - old_prefix_log_prob), max=80.0))
+    # lower bound is active only when 1 - sqrt(2 * t * delta_low / pi_old_prefix) > 0.
+    low_radius = torch.exp(torch.clamp(0.5 * (log_2_delta_low + log_prefix_len - old_prefix_log_prob), max=80.0))
     lower_ratio_bound = 1.0 - low_radius
     lower_active = lower_ratio_bound > 0.0
     neg_inf = torch.full_like(lower_ratio_bound, -torch.inf)
@@ -2103,6 +2108,12 @@ def compute_policy_loss_prefix_ripo_clip(
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
         "actor/prefix_ripo_clip/delta_low": delta_low,
         "actor/prefix_ripo_clip/delta_high": delta_high,
+        "actor/prefix_ripo_clip/prefix_kl_budget_low_mean": verl_F.masked_mean(
+            (prefix_len.detach() * delta_low), response_mask
+        ).item(),
+        "actor/prefix_ripo_clip/prefix_kl_budget_high_mean": verl_F.masked_mean(
+            (prefix_len.detach() * delta_high), response_mask
+        ).item(),
         "actor/prefix_ripo_clip/avg_log_ratio_mean": verl_F.masked_mean(
             prefix_avg_log_ratio.detach(), response_mask
         ).item(),
@@ -2245,6 +2256,17 @@ def compute_policy_loss_prefix_sqrt_dynamic_clip(
     pg_clipfrac_lower = verl_F.masked_mean((clipped & (prefix_avg_log_ratio < -eps_neg)).float(), response_mask)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
+    lower_clipped = clipped & (prefix_avg_log_ratio < -eps_neg)
+    _dump_prefix_clip_response_diagnostics(
+        loss_name="prefix_sqrt_dynamic_clip",
+        response_mask=response_mask,
+        clipped=clipped,
+        lower_clipped=lower_clipped,
+        prefix_avg_log_ratio=prefix_avg_log_ratio,
+        eps_pos=eps_pos,
+        eps_neg=eps_neg,
+    )
+
     pg_metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
@@ -2281,6 +2303,9 @@ def compute_policy_loss_prefix_sqrt_dynamic_clip(
         pg_metrics[f"{bucket_prefix}/pg_clipfrac"] = verl_F.masked_mean(
             clipped.float(), bucket_mask_float
         ).detach().item()
+        pg_metrics[f"{bucket_prefix}/pg_clipfrac_lower"] = verl_F.masked_mean(
+            lower_clipped.float(), bucket_mask_float
+        ).detach().item()
         pg_metrics[f"{bucket_prefix}/avg_log_ratio_abs_mean"] = verl_F.masked_mean(
             prefix_avg_log_ratio.detach().abs(), bucket_mask_float
         ).detach().item()
@@ -2289,6 +2314,48 @@ def compute_policy_loss_prefix_sqrt_dynamic_clip(
         ).detach().item()
         pg_metrics[f"{bucket_prefix}/eps_neg_mean"] = verl_F.masked_mean(
             eps_neg.detach(), bucket_mask_float
+        ).detach().item()
+
+    seq_len_flat = seq_len.squeeze(-1)
+    clipped_valid = clipped & valid_response_mask
+    clipped_lower_valid = lower_clipped & valid_response_mask
+    length_buckets = [
+        (0, 1024, "00000_01024"),
+        (1024, 2048, "01024_02048"),
+        (2048, 4096, "02048_04096"),
+        (4096, 8192, "04096_08192"),
+        (8192, 12288, "08192_12288"),
+        (12288, 16000, "12288_16000"),
+        (16000, None, "16000_plus"),
+    ]
+    for lower, upper, label in length_buckets:
+        if upper is None:
+            seq_bucket_mask = seq_len_flat >= lower
+        else:
+            seq_bucket_mask = (seq_len_flat >= lower) & (seq_len_flat < upper)
+        seq_bucket_mask_float = seq_bucket_mask.float()
+        token_bucket_mask = valid_response_mask & seq_bucket_mask.unsqueeze(-1)
+        token_bucket_mask_float = token_bucket_mask.float()
+        seq_bucket_denom = seq_bucket_mask_float.sum().clamp(min=1.0)
+        len_prefix = f"actor/prefix_sqrt_clip/response_len_bucket_{label}"
+        pg_metrics[f"{len_prefix}/response_frac"] = seq_bucket_mask_float.mean().detach().item()
+        pg_metrics[f"{len_prefix}/token_frac"] = verl_F.masked_mean(
+            token_bucket_mask_float, response_mask
+        ).detach().item()
+        pg_metrics[f"{len_prefix}/response_len_mean"] = (
+            (seq_len_flat.detach() * seq_bucket_mask_float).sum() / seq_bucket_denom
+        ).item()
+        pg_metrics[f"{len_prefix}/token_pg_clipfrac"] = verl_F.masked_mean(
+            clipped.float(), token_bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{len_prefix}/token_pg_clipfrac_lower"] = verl_F.masked_mean(
+            clipped_lower_valid.float(), token_bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{len_prefix}/response_any_clipfrac"] = (
+            (clipped_valid.any(dim=-1).float() * seq_bucket_mask_float).sum() / seq_bucket_denom
+        ).detach().item()
+        pg_metrics[f"{len_prefix}/response_any_lower_clipfrac"] = (
+            (clipped_lower_valid.any(dim=-1).float() * seq_bucket_mask_float).sum() / seq_bucket_denom
         ).detach().item()
 
     return pg_loss, pg_metrics

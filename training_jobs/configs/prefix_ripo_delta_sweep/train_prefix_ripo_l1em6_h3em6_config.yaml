@@ -1,0 +1,41 @@
+TaskName: prefix-ripo-l1em6-h3em6
+Description: Prefix RIPO-like order sweep, average-token delta_low=1e-6, delta_high=3e-6
+Entrypoint: RIPO_DELTA_LOW=1e-6 RIPO_DELTA_HIGH=3e-6 EXPERIMENT_NAME=prefix-ripo-l1em6-h3em6-qwen3-4b-8gpu bash /GenSIvePFS/users/cxli/verl/training_jobs/scripts/run_prefix_ripo_clip_qwen3_4b_base_processed_8gpu_300.sh
+ImageUrl: gensi-cn-beijing.cr.volces.com/sia-thu/verl:v0
+ResourceQueueID: q-20250929101814-vmcz2
+ResourceQueueName: sia-thu
+Framework: PyTorchDDP
+TaskRoleSpecs:
+  - RoleName: worker
+    RoleReplicas: 1
+    Flavor: ml.pni2.28xlarge
+ActiveDeadlineSeconds: 864000
+DelayExitTimeSeconds: 0
+AccessType: Public
+Preemptible: true
+Priority: 6
+RetryOptions:
+  EnableRetry: true
+  EnableReserveResourceOnRetry: true
+  MaxRetryTimes: 5
+  IntervalSeconds: 120
+  PolicySets:
+    - Failed
+    - InstanceReclaimed
+DiagOptions:
+  - Name: EnvironmentalDiagnosis
+    Enable: false
+  - Name: PythonDetection
+    Enable: true
+    PythonDetectionInterval: 3600
+  - Name: LogDetection
+    Enable: false
+EnableTensorBoard: true
+TensorBoardStorage:
+  Type: Vepfs
+  SubPath: users/cxli/verl/train_logs/verl_math_repro/prefix-ripo-l1em6-h3em6-qwen3-4b-8gpu/tensorboard
+Storages:
+  - Type: Vepfs
+    MountPath: /GenSIvePFS/users/cxli
+    SubPath: users/cxli
+    ReadOnly: false

@@ -90,11 +90,11 @@ policy_loss:
   # Log-space cap for prefix-sum likelihood-ratio clipping
   prefix_clip_sum_alpha: 2.0
 
-  # RIPO-like lower trust-region budget for prefix RIPO clip
-  prefix_ripo_delta_low: 0.05
+  # RIPO-like average-token lower trust-region budget for prefix RIPO clip
+  prefix_ripo_delta_low: 1e-5
 
-  # RIPO-like upper trust-region budget for prefix RIPO clip
-  prefix_ripo_delta_high: 0.05
+  # RIPO-like average-token upper trust-region budget for prefix RIPO clip
+  prefix_ripo_delta_high: 3e-5
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
