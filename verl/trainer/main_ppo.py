@@ -308,7 +308,10 @@ class TaskRunner:
         trainer.init_workers()
 
         # Start the training process.
-        trainer.fit()
+        try:
+            trainer.fit()
+        finally:
+            trainer.shutdown()
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):
