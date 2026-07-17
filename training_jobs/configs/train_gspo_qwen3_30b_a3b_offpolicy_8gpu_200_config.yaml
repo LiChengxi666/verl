@@ -1,0 +1,46 @@
+TaskName: gspo-moe-offpolicy-n2-8gpu-200
+Description: Formal GSPO Qwen3-30B-A3B fixed-delay n=2 off-policy baseline, 200 steps, 1x8 A100
+Entrypoint: bash /GenSIvePFS/users/cxli/verl/training_jobs/scripts/run_gspo_qwen3_30b_a3b_offpolicy_8gpu_200.sh
+Envs:
+  - Name: EXPERIMENT_NAME
+    Value: gspo_moe_offpolicy_n2_8gpu_200
+  - Name: RUN_ID
+    Value: gspo_moe_offpolicy_n2_8gpu_200
+ImageUrl: gensi-cn-beijing.cr.volces.com/sia-thu/verl:v0
+ResourceQueueID: q-20250929101814-vmcz2
+ResourceQueueName: sia-thu
+Framework: PyTorchDDP
+TaskRoleSpecs:
+  - RoleName: worker
+    RoleReplicas: 1
+    Flavor: ml.pni2.28xlarge
+ActiveDeadlineSeconds: 0
+DelayExitTimeSeconds: 0
+AccessType: Public
+Preemptible: true
+Priority: 6
+RetryOptions:
+  EnableRetry: true
+  EnableReserveResourceOnRetry: true
+  MaxRetryTimes: 5
+  IntervalSeconds: 120
+  PolicySets:
+    - Failed
+    - InstanceReclaimed
+DiagOptions:
+  - Name: EnvironmentalDiagnosis
+    Enable: false
+  - Name: PythonDetection
+    Enable: true
+    PythonDetectionInterval: 3600
+  - Name: LogDetection
+    Enable: false
+EnableTensorBoard: true
+TensorBoardStorage:
+  Type: Vepfs
+  SubPath: users/cxli/verl/train_logs/verl_moe/gspo_moe_offpolicy_n2_8gpu_200/tensorboard
+Storages:
+  - Type: Vepfs
+    MountPath: /GenSIvePFS/users/cxli
+    SubPath: users/cxli
+    ReadOnly: false

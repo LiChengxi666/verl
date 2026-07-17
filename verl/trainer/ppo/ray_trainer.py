@@ -954,6 +954,13 @@ class RayPPOTrainer:
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
+        if self.rollout_buffer is not None and self.global_steps < self.rollout_buffer.delay_steps:
+            print(
+                "Skipping fixed-delay checkpoint before the rollout queue reaches steady state: "
+                f"global_step={self.global_steps}, delay_steps={self.rollout_buffer.delay_steps}"
+            )
+            return
+
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(
             self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
@@ -1000,9 +1007,14 @@ class RayPPOTrainer:
 
         # save dataloader
         local_mkdir_safe(local_global_step_folder)
-        dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
+        dataloader_local_path = Path(local_global_step_folder) / "data.pt"
         dataloader_state_dict = self.train_dataloader.state_dict()
-        torch.save(dataloader_state_dict, dataloader_local_path)
+        dataloader_temporary_path = dataloader_local_path.with_name(f".data.{uuid.uuid4().hex}.tmp")
+        torch.save(dataloader_state_dict, dataloader_temporary_path)
+        with dataloader_temporary_path.open("rb") as file:
+            os.fsync(file.fileno())
+        os.replace(dataloader_temporary_path, dataloader_local_path)
+        _fsync_directory(dataloader_local_path.parent)
 
         async_save = (
             hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
@@ -1148,19 +1160,29 @@ class RayPPOTrainer:
         # TODO: from remote not implemented yet
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
-            steps_per_epoch = len(self.train_dataloader)
-            at_epoch_boundary = steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0
-            if at_epoch_boundary:
-                print(
-                    f"Skipping dataloader state restore: global_steps={self.global_steps} "
-                    f"is at an epoch boundary (steps_per_epoch={steps_per_epoch}). "
-                    f"The saved state marks the dataloader as exhausted. "
-                    f"Next epoch will iterate from scratch."
-                )
-            else:
+            if self.rollout_buffer is not None:
+                # Fixed-delay warm-up consumes extra prompt batches, so global_steps
+                # cannot be used to infer an epoch boundary. Restore the exact cursor.
                 dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
                 self.train_dataloader.load_state_dict(dataloader_state_dict)
+            else:
+                steps_per_epoch = len(self.train_dataloader)
+                at_epoch_boundary = steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0
+                if at_epoch_boundary:
+                    print(
+                        f"Skipping dataloader state restore: global_steps={self.global_steps} "
+                        f"is at an epoch boundary (steps_per_epoch={steps_per_epoch}). "
+                        f"The saved state marks the dataloader as exhausted. "
+                        f"Next epoch will iterate from scratch."
+                    )
+                else:
+                    dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+                    self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
+            if self.rollout_buffer is not None:
+                raise RolloutBufferCheckpointError(
+                    f"Fixed-delay checkpoint is missing dataloader state: {dataloader_local_path}"
+                )
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
         self._load_rollout_buffer(global_step_folder)
@@ -1175,6 +1197,14 @@ class RayPPOTrainer:
 
         if not enabled:
             return
+        if self.config.trainer.get("remove_previous_ckpt_in_save", False) or any(
+            self.config.trainer.get(name, None) is not None
+            for name in ("max_actor_ckpt_to_keep", "max_critic_ckpt_to_keep")
+        ):
+            raise ValueError(
+                "Fixed-delay checkpoints require whole-checkpoint retention: set "
+                "remove_previous_ckpt_in_save=False and max_actor_ckpt_to_keep/max_critic_ckpt_to_keep=null"
+            )
         if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
             raise NotImplementedError("The fixed-delay rollout buffer does not support REMAX yet.")
         if self.use_rollout_buffer_log_probs and not self.config.actor_rollout_ref.rollout.calculate_log_probs:
@@ -1506,6 +1536,7 @@ class RayPPOTrainer:
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
                 timing_raw = {}
+                save_checkpoint_this_step = False
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -1787,8 +1818,7 @@ class RayPPOTrainer:
                         ):
                             if esi_close_to_expiration:
                                 print("Force saving checkpoint: ESI instance expiration approaching.")
-                            with marked_timer("save_checkpoint", timing_raw, color="green"):
-                                self._save_checkpoint()
+                            save_checkpoint_this_step = True
 
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
@@ -1860,10 +1890,9 @@ class RayPPOTrainer:
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
-                if self.config.trainer.save_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
-                ):
-                    self._snapshot_metrics_file()
+                if save_checkpoint_this_step:
+                    with marked_timer("save_checkpoint", timing_raw, color="green"):
+                        self._save_checkpoint()
 
                 progress_bar.update(1)
                 self.global_steps += 1
