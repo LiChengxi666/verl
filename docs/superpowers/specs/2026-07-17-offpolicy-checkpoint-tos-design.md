@@ -118,4 +118,3 @@ terminates it, resumes with the same experiment name, and asserts that the
 first resumed training update has `policy_version_lag=2`. A storage preflight
 also writes, renames, reads, and deletes a probe under the CloudFS checkpoint
 root before the formal task is submitted.
-
