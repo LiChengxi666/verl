@@ -193,6 +193,14 @@ def _validate_manifest(manifest: dict, expected_checkpoint_step: int, delay_step
         raise RolloutBufferCheckpointError("rollout buffer batches must be a list")
     if len(manifest["batches"]) != delay_steps:
         raise RolloutBufferCheckpointError("rollout buffer queue length does not match configured delay")
+    expected_policy_versions = list(range(expected_checkpoint_step - delay_steps, expected_checkpoint_step))
+    policy_versions = [batch.get("policy_version") for batch in manifest["batches"] if isinstance(batch, dict)]
+    if policy_versions != expected_policy_versions:
+        raise RolloutBufferCheckpointError("rollout buffer policy versions do not match checkpoint step")
+    expected_generation_steps = list(range(manifest["generation_step"] - delay_steps + 1, manifest["generation_step"] + 1))
+    generation_steps = [batch.get("generation_step") for batch in manifest["batches"] if isinstance(batch, dict)]
+    if generation_steps != expected_generation_steps:
+        raise RolloutBufferCheckpointError("rollout buffer generation steps are not the latest contiguous window")
 
 
 def _validate_batch_metadata(batch_metadata: object, index: int, snapshot_id: str | None) -> str:

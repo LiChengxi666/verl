@@ -213,3 +213,16 @@ def test_checkpoint_syncs_batches_before_manifest_publication(tmp_path, monkeypa
     source.save_to_directory(checkpoint_directory, checkpoint_step=5, generation_step=9)
 
     assert events == ["batch", "batch", "directory_sync", "manifest", "directory_sync"]
+
+
+def test_checkpoint_rejects_policy_versions_incompatible_with_actor_step(tmp_path):
+    checkpoint_directory = _save_checkpoint(tmp_path)
+    manifest_path = checkpoint_directory / "manifest.json"
+    manifest = _read_manifest(checkpoint_directory)
+    manifest["batches"][0]["policy_version"] = 2
+    manifest_path.write_text(json.dumps(manifest))
+
+    with pytest.raises(RolloutBufferCheckpointError, match="policy versions"):
+        FixedDelayRolloutBuffer(delay_steps=2).load_from_directory(
+            checkpoint_directory, expected_checkpoint_step=5
+        )

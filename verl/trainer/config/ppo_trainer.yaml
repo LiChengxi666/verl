@@ -133,6 +133,18 @@ trainer:
   # Number of generations to log during validation
   log_val_generations: 0
 
+  # Fixed-delay FIFO used to create controlled off-policy training data
+  rollout_buffer:
+
+    # Whether to delay rollout batches before policy updates
+    enable: False
+
+    # Number of rollout iterations to delay each generated batch
+    delay_steps: 0
+
+    # Use generation-time log probabilities as the GSPO behavior policy
+    use_rollout_log_probs: True
+
   # Directory for logging rollout data; no dump if null
   rollout_data_dir: null
 
@@ -190,6 +202,10 @@ trainer:
 
   # Maximum number of critic checkpoints to keep
   max_critic_ckpt_to_keep: null
+
+  # Maximum number of complete global_step_* checkpoint directories to keep.
+  # Unlike actor/critic retention, this removes the whole transactional checkpoint.
+  max_complete_ckpt_to_keep: null
 
   # Timeout (in seconds) for Ray worker to wait for registration
   ray_wait_register_center_timeout: 300

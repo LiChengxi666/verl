@@ -20,9 +20,11 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import shutil
 import uuid
 from collections import defaultdict
 from pprint import pprint
+from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -47,6 +49,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_variance_proxy_metrics,
     process_validation_metrics,
 )
+from verl.trainer.ppo.rollout_buffer import FixedDelayRolloutBuffer, RolloutBufferCheckpointError
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import (
     Role,
@@ -70,6 +73,56 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_write_text(path: Path, contents: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary_path.open("w", encoding="utf-8") as file:
+            file.write(contents)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, path)
+        _fsync_directory(path.parent)
+    finally:
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def prune_complete_checkpoints(root_path: str | os.PathLike, max_to_keep: int | None) -> list[Path]:
+    """Remove oldest complete checkpoint directories and leave incomplete ones untouched."""
+    if not isinstance(max_to_keep, int) or isinstance(max_to_keep, bool) or max_to_keep <= 0:
+        return []
+
+    complete_checkpoints = []
+    for checkpoint_path in Path(root_path).glob("global_step_*"):
+        if not checkpoint_path.is_dir():
+            continue
+        try:
+            step = int(checkpoint_path.name.removeprefix("global_step_"))
+            payload = json.loads((checkpoint_path / "_SUCCESS").read_text(encoding="utf-8"))
+        except (ValueError, OSError, json.JSONDecodeError):
+            continue
+        if payload.get("schema_version") == 1 and payload.get("global_step") == step:
+            complete_checkpoints.append((step, checkpoint_path))
+
+    complete_checkpoints.sort()
+    removed = []
+    for _, checkpoint_path in complete_checkpoints[:-max_to_keep]:
+        shutil.rmtree(checkpoint_path)
+        removed.append(checkpoint_path)
+    return removed
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -398,6 +451,21 @@ class RayPPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def shutdown(self):
+        """Stop active dataloader workers before the owning Ray actor exits."""
+        for dataloader_name in ("train_dataloader", "val_dataloader"):
+            dataloader = getattr(self, dataloader_name, None)
+            iterator = getattr(dataloader, "_iterator", None)
+            shutdown_workers = getattr(iterator, "_shutdown_workers", None)
+            if callable(shutdown_workers):
+                shutdown_workers()
+            if dataloader is not None:
+                dataloader._iterator = None
+
+    def _resume_rollout_after_buffer_warmup(self, policy_version: int):
+        """Resume HYBRID rollout through its supported weight-sync lifecycle."""
+        self.checkpoint_manager.update_weights(policy_version)
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -936,23 +1004,76 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
-        # latest checkpointed iteration tracker (for atomic usage)
-        if (
+        async_save = (
             hasattr(self.config.actor_rollout_ref.actor.checkpoint, "async_save")
             and self.config.actor_rollout_ref.actor.checkpoint.async_save
         ) or (
             "async_save" in self.config.actor_rollout_ref.actor.checkpoint
             and self.config.actor_rollout_ref.actor.checkpoint["async_save"]
-        ):
+        )
+        if async_save:
+            if self.rollout_buffer is not None:
+                raise RuntimeError("Fixed-delay rollout checkpoints do not support actor checkpoint async_save")
             print("skip write latest_checkpointed_iteration.txt when async_save is True")
             return
-        local_latest_checkpointed_iteration = os.path.join(
-            self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
-        )
-        with open(local_latest_checkpointed_iteration, "w") as f:
-            f.write(str(self.global_steps))
 
+        self._finalize_checkpoint(local_global_step_folder)
+
+    def _finalize_checkpoint(self, local_global_step_folder: str) -> None:
+        """Publish driver-owned state before advancing the latest pointer."""
+        self._save_rollout_buffer(local_global_step_folder)
         self._snapshot_metrics_file(local_global_step_folder)
+        self._write_checkpoint_success_marker(local_global_step_folder)
+        self._write_latest_checkpoint_pointer()
+        prune_complete_checkpoints(
+            self.config.trainer.default_local_dir,
+            getattr(self.config.trainer, "max_complete_ckpt_to_keep", None),
+        )
+
+    def _save_rollout_buffer(self, local_global_step_folder: str) -> None:
+        if self.rollout_buffer is None:
+            return
+        self.rollout_buffer.save_to_directory(
+            os.path.join(local_global_step_folder, "rollout_buffer"),
+            checkpoint_step=self.global_steps,
+            generation_step=self.rollout_generation_step,
+        )
+
+    def _write_checkpoint_success_marker(self, local_global_step_folder: str) -> None:
+        payload = {
+            "schema_version": 1,
+            "global_step": self.global_steps,
+            "rollout_buffer_enabled": self.rollout_buffer is not None,
+        }
+        _atomic_write_text(Path(local_global_step_folder) / "_SUCCESS", json.dumps(payload, sort_keys=True))
+
+    def _write_latest_checkpoint_pointer(self) -> None:
+        tracker_path = Path(self.config.trainer.default_local_dir) / "latest_checkpointed_iteration.txt"
+        _atomic_write_text(tracker_path, str(self.global_steps))
+
+    def _validate_checkpoint_success_marker(self, global_step_folder: str) -> None:
+        marker_path = Path(global_step_folder) / "_SUCCESS"
+        try:
+            payload = json.loads(marker_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise RolloutBufferCheckpointError(f"Missing or invalid checkpoint marker: {marker_path}") from error
+        expected = {
+            "schema_version": 1,
+            "global_step": self.global_steps,
+            "rollout_buffer_enabled": True,
+        }
+        if payload != expected:
+            raise RolloutBufferCheckpointError(
+                f"Checkpoint marker is incompatible with fixed-delay restore: {marker_path}"
+            )
+
+    def _load_rollout_buffer(self, global_step_folder: str) -> None:
+        if self.rollout_buffer is None:
+            return
+        self.rollout_generation_step = self.rollout_buffer.load_from_directory(
+            os.path.join(global_step_folder, "rollout_buffer"),
+            expected_checkpoint_step=self.global_steps,
+        )
 
     def _snapshot_metrics_file(self, local_global_step_folder: str | None = None):
         metrics_path = os.getenv("VERL_FILE_LOGGER_PATH", None)
@@ -1008,6 +1129,9 @@ class RayPPOTrainer:
         print(f"Setting global step to {self.global_steps}")
         print(f"Resuming from {global_step_folder}")
 
+        if self.rollout_buffer is not None:
+            self._validate_checkpoint_success_marker(global_step_folder)
+
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
         # load actor
@@ -1038,6 +1162,26 @@ class RayPPOTrainer:
                 self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+
+        self._load_rollout_buffer(global_step_folder)
+
+    def _initialize_rollout_buffer(self) -> None:
+        rollout_buffer_config = self.config.trainer.get("rollout_buffer", {})
+        enabled = bool(rollout_buffer_config.get("enable", False))
+        delay_steps = int(rollout_buffer_config.get("delay_steps", 0))
+        self.use_rollout_buffer_log_probs = bool(rollout_buffer_config.get("use_rollout_log_probs", True))
+        self.rollout_buffer = FixedDelayRolloutBuffer(delay_steps) if enabled else None
+        self.rollout_generation_step = 0
+
+        if not enabled:
+            return
+        if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+            raise NotImplementedError("The fixed-delay rollout buffer does not support REMAX yet.")
+        if self.use_rollout_buffer_log_probs and not self.config.actor_rollout_ref.rollout.calculate_log_probs:
+            raise ValueError(
+                "trainer.rollout_buffer.use_rollout_log_probs=True requires "
+                "actor_rollout_ref.rollout.calculate_log_probs=True."
+            )
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1311,11 +1455,20 @@ class RayPPOTrainer:
 
         self.global_steps = 0
 
+        self._initialize_rollout_buffer()
+
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
         self.checkpoint_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
+
+        if self.rollout_buffer is not None:
+            print(
+                "Fixed-delay rollout buffer enabled: "
+                f"delay_steps={self.rollout_buffer.delay_steps}, "
+                f"use_rollout_log_probs={self.use_rollout_buffer_log_probs}"
+            )
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -1427,6 +1580,38 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    if self.rollout_buffer is not None:
+                        self.rollout_generation_step += 1
+                        completed_policy_updates = self.global_steps - 1
+                        buffered_rollout = self.rollout_buffer.push(
+                            batch,
+                            policy_version=completed_policy_updates,
+                            generation_step=self.rollout_generation_step,
+                        )
+                        if buffered_rollout is None:
+                            print(
+                                "Warming up fixed-delay rollout buffer: "
+                                f"{len(self.rollout_buffer)}/{self.rollout_buffer.delay_steps} batches queued"
+                            )
+                            self._resume_rollout_after_buffer_warmup(completed_policy_updates)
+                            with marked_timer("stop_profile", timing_raw):
+                                self._stop_profiling(curr_step_profile)
+                            continue
+
+                        batch = buffered_rollout.batch
+                        policy_version_lag = completed_policy_updates - buffered_rollout.policy_version
+                        metrics.update(
+                            {
+                                "rollout_buffer/configured_delay_steps": self.rollout_buffer.delay_steps,
+                                "rollout_buffer/queued_batches": len(self.rollout_buffer),
+                                "rollout_buffer/behavior_policy_version": buffered_rollout.policy_version,
+                                "rollout_buffer/current_policy_version": completed_policy_updates,
+                                "rollout_buffer/policy_version_lag": policy_version_lag,
+                                "rollout_buffer/generation_step": buffered_rollout.generation_step,
+                            }
+                        )
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -1458,7 +1643,14 @@ class RayPPOTrainer:
                     #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                    if self.rollout_buffer is not None and self.use_rollout_buffer_log_probs:
+                        if "rollout_log_probs" not in batch.batch:
+                            raise ValueError(
+                                "The delayed rollout batch has no rollout_log_probs. "
+                                "Set actor_rollout_ref.rollout.calculate_log_probs=True."
+                            )
+                        batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
+                    elif bypass_recomputing_logprobs:  # Use `rollout_log_probs`
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
                         apply_bypass_mode(
