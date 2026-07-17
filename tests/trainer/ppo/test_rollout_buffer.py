@@ -187,3 +187,29 @@ def test_checkpoint_rejects_incomplete_fixed_delay_queue(tmp_path):
     restored = FixedDelayRolloutBuffer(delay_steps=2)
     with pytest.raises(RolloutBufferCheckpointError):
         restored.load_from_directory(checkpoint_directory, expected_checkpoint_step=5)
+
+
+def test_checkpoint_syncs_batches_before_manifest_publication(tmp_path, monkeypatch):
+    checkpoint_directory = tmp_path / "rollout_buffer"
+    source = FixedDelayRolloutBuffer(delay_steps=2)
+    source.push(make_batch(11), policy_version=3, generation_step=8)
+    source.push(make_batch(12), policy_version=4, generation_step=9)
+    events = []
+    original_replace = rollout_buffer.os.replace
+    original_fsync_directory = rollout_buffer._fsync_directory
+
+    def record_replace(source_path, destination_path):
+        destination_name = Path(destination_path).name
+        events.append("manifest" if destination_name == "manifest.json" else "batch")
+        original_replace(source_path, destination_path)
+
+    def record_directory_sync(directory):
+        events.append("directory_sync")
+        original_fsync_directory(directory)
+
+    monkeypatch.setattr(rollout_buffer.os, "replace", record_replace)
+    monkeypatch.setattr(rollout_buffer, "_fsync_directory", record_directory_sync)
+
+    source.save_to_directory(checkpoint_directory, checkpoint_step=5, generation_step=9)
+
+    assert events == ["batch", "batch", "directory_sync", "manifest", "directory_sync"]

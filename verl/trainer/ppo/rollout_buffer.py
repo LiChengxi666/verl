@@ -109,6 +109,10 @@ class FixedDelayRolloutBuffer:
                 }
             )
 
+        # Persist every published batch directory entry before making a
+        # manifest that references those entries authoritative.
+        _fsync_directory(checkpoint_directory)
+
         manifest = {
             "schema_version": _CHECKPOINT_SCHEMA_VERSION,
             "checkpoint_step": checkpoint_step,
@@ -122,6 +126,7 @@ class FixedDelayRolloutBuffer:
             file.flush()
             os.fsync(file.fileno())
         os.replace(temporary_manifest_path, checkpoint_directory / "manifest.json")
+        _fsync_directory(checkpoint_directory)
         _remove_obsolete_batch_files(checkpoint_directory, {batch["filename"] for batch in batches})
 
     def load_from_directory(
@@ -258,6 +263,15 @@ def _remove_obsolete_batch_files(checkpoint_directory: Path, current_filenames: 
                 batch_path.unlink()
             except OSError:
                 pass
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Make preceding directory-entry updates durable before publication continues."""
+    descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _is_int(value: object) -> bool:
