@@ -278,7 +278,7 @@ PY
     trainer.default_local_dir="${CKPT_DIR}" \
     trainer.max_actor_ckpt_to_keep=null \
     trainer.max_critic_ckpt_to_keep=null \
-    trainer.max_complete_ckpt_to_keep=2 \
+    trainer.max_complete_ckpt_to_keep=1 \
     trainer.validation_data_dir="${VAL_DUMP_DIR}" \
     trainer.total_training_steps="${TOTAL_TRAINING_STEPS}" \
     '+ray_kwargs.ray_init.runtime_env.env_vars.VLLM_USE_V1="1"' \
