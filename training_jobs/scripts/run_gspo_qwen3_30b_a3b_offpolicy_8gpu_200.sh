@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-cd /GenSIvePFS/users/cxli/verl
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+cd "${REPO_ROOT}"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export HYDRA_FULL_ERROR=1
@@ -17,9 +19,9 @@ export MLP_WORKER_NUM="${MLP_WORKER_NUM:-1}"
 export MLP_WORKER_GPU="${MLP_WORKER_GPU:-8}"
 export MLP_WORKER_0_HOST="${MLP_WORKER_0_HOST:-127.0.0.1}"
 
-export MODEL_PATH="${MODEL_PATH:-/GenSIvePFS/users/cxli/models/Qwen3-30B-A3B-Base}"
-export TRAIN_FILE="${TRAIN_FILE:-/GenSIvePFS/users/cxli/verl/data/data_processed/math-17k.parquet}"
-export VAL_FILES="${VAL_FILES:-[\"/GenSIvePFS/users/cxli/verl/data/data_processed/moe_eval/minpro/amc23.parquet\",\"/GenSIvePFS/users/cxli/verl/data/data_processed/moe_eval/minpro/aime24.parquet\",\"/GenSIvePFS/users/cxli/verl/data/data_processed/moe_eval/minpro/aime25.parquet\"]}"
+export MODEL_PATH="${MODEL_PATH:-${REPO_ROOT}/models/Qwen3-30B-A3B-Base}"
+export TRAIN_FILE="${TRAIN_FILE:-${REPO_ROOT}/data/data_processed/math-17k.parquet}"
+export VAL_FILES="${VAL_FILES:-[\"${REPO_ROOT}/data/data_processed/moe_eval/minpro/amc23.parquet\",\"${REPO_ROOT}/data/data_processed/moe_eval/minpro/aime24.parquet\",\"${REPO_ROOT}/data/data_processed/moe_eval/minpro/aime25.parquet\"]}"
 export ROLLOUT_TP="${ROLLOUT_TP:-4}"
 export ROLLOUT_DP="${ROLLOUT_DP:-2}"
 export ROLLOUT_EP="${ROLLOUT_EP:-8}"
@@ -34,11 +36,11 @@ export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-200}"
 
 export PROJECT_NAME="${PROJECT_NAME:-verl_moe}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-gspo_moe_offpolicy_n2_8gpu_200}"
-export TRAINER_LOGGER="${TRAINER_LOGGER:-[\"console\",\"file\",\"tensorboard\",\"wandb\"]}"
-export CKPT_ROOT=/GenSIvePFS/users/cxli/verl/checkpoints
+export OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}}"
+export CKPT_ROOT="${CKPT_ROOT:-${OUTPUT_ROOT}/checkpoints}"
 export CKPT_DIR=${CKPT_ROOT}/${PROJECT_NAME}/${EXPERIMENT_NAME}
-export LOG_DIR=/GenSIvePFS/users/cxli/verl/train_logs/${PROJECT_NAME}/${EXPERIMENT_NAME}
-export VAL_DUMP_DIR=/GenSIvePFS/users/cxli/verl/validation_generations/${PROJECT_NAME}/${EXPERIMENT_NAME}
+export LOG_DIR="${LOG_DIR:-${OUTPUT_ROOT}/train_logs/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
+export VAL_DUMP_DIR="${VAL_DUMP_DIR:-${OUTPUT_ROOT}/validation_generations/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
 export RUN_ID="${RUN_ID:-${EXPERIMENT_NAME}}"
 export RAY_READY_FILE="${LOG_DIR}/.ray_ready_${RUN_ID}"
 export RAY_DONE_FILE="${LOG_DIR}/.ray_done_${RUN_ID}"
@@ -55,7 +57,15 @@ export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
 export WANDB_RUN_ID="${WANDB_RUN_ID:-${EXPERIMENT_NAME}}"
 export WANDB_ENTITY="${WANDB_ENTITY:-licx199}"
-export WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-/GenSIvePFS/users/cxli/.secrets/wandb_api_key}"
+export WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-${REPO_ROOT}/.secrets/wandb_api_key}"
+
+if [ -z "${TRAINER_LOGGER:-}" ]; then
+  if [ -n "${WANDB_API_KEY:-}" ] || [ -r "${WANDB_API_KEY_FILE}" ]; then
+    export TRAINER_LOGGER='["console","file","tensorboard","wandb"]'
+  else
+    export TRAINER_LOGGER='["console","file","tensorboard"]'
+  fi
+fi
 
 if [[ "${TRAINER_LOGGER}" == *wandb* ]] && [ -z "${WANDB_API_KEY:-}" ]; then
   if [ ! -r "${WANDB_API_KEY_FILE}" ]; then

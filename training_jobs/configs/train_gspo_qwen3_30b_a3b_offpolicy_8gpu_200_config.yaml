@@ -6,6 +6,12 @@ Envs:
     Value: gspo_moe_offpolicy_n2_8gpu_200
   - Name: RUN_ID
     Value: gspo_moe_offpolicy_n2_8gpu_200
+  - Name: MODEL_PATH
+    Value: /GenSIvePFS/users/cxli/models/Qwen3-30B-A3B-Base
+  - Name: OUTPUT_ROOT
+    Value: /GenSIvePFS/users/cxli/verl
+  - Name: WANDB_API_KEY_FILE
+    Value: /GenSIvePFS/users/cxli/.secrets/wandb_api_key
 ImageUrl: gensi-cn-beijing.cr.volces.com/sia-thu/verl:v0
 ResourceQueueID: q-20250929101814-vmcz2
 ResourceQueueName: sia-thu
