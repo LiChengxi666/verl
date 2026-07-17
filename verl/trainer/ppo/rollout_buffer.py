@@ -18,6 +18,8 @@ import hashlib
 import json
 import os
 import pickle
+import re
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +29,7 @@ from verl import DataProto
 
 _CHECKPOINT_SCHEMA_VERSION = 1
 _CHECKSUM_CHUNK_SIZE = 1024 * 1024
+_BATCH_FILENAME_PATTERN = re.compile(r"batch_([0-9a-f]{32})_(\d+)\.pkl")
 
 
 class RolloutBufferCheckpointError(RuntimeError):
@@ -82,10 +85,13 @@ class FixedDelayRolloutBuffer:
         """Persist the buffered rollouts and publish their manifest atomically."""
         checkpoint_directory = Path(directory)
         checkpoint_directory.mkdir(parents=True, exist_ok=True)
+        if len(self._queue) != self.delay_steps:
+            raise RolloutBufferCheckpointError("rollout buffer queue length does not match configured delay")
 
         batches = []
+        snapshot_id = uuid.uuid4().hex
         for index, rollout in enumerate(self._queue):
-            filename = f"batch_{index}.pkl"
+            filename = f"batch_{snapshot_id}_{index}.pkl"
             batch_path = checkpoint_directory / filename
             temporary_path = checkpoint_directory / f"{filename}.tmp"
             with temporary_path.open("wb") as file:
@@ -116,6 +122,7 @@ class FixedDelayRolloutBuffer:
             file.flush()
             os.fsync(file.fileno())
         os.replace(temporary_manifest_path, checkpoint_directory / "manifest.json")
+        _remove_obsolete_batch_files(checkpoint_directory, {batch["filename"] for batch in batches})
 
     def load_from_directory(
         self,
@@ -128,8 +135,9 @@ class FixedDelayRolloutBuffer:
         _validate_manifest(manifest, expected_checkpoint_step, self.delay_steps)
 
         restored_queue = deque()
+        snapshot_id = None
         for index, batch_metadata in enumerate(manifest["batches"]):
-            _validate_batch_metadata(batch_metadata, index)
+            snapshot_id = _validate_batch_metadata(batch_metadata, index, snapshot_id)
             batch_path = checkpoint_directory / batch_metadata["filename"]
             _validate_batch_file(batch_path, batch_metadata)
             restored_queue.append(_load_buffered_rollout(batch_path, batch_metadata))
@@ -178,19 +186,26 @@ def _validate_manifest(manifest: dict, expected_checkpoint_step: int, delay_step
         raise RolloutBufferCheckpointError("rollout buffer generation step must be an integer")
     if not isinstance(manifest["batches"], list):
         raise RolloutBufferCheckpointError("rollout buffer batches must be a list")
-    if len(manifest["batches"]) > delay_steps:
-        raise RolloutBufferCheckpointError("rollout buffer queue exceeds configured delay")
+    if len(manifest["batches"]) != delay_steps:
+        raise RolloutBufferCheckpointError("rollout buffer queue length does not match configured delay")
 
 
-def _validate_batch_metadata(batch_metadata: object, index: int) -> None:
+def _validate_batch_metadata(batch_metadata: object, index: int, snapshot_id: str | None) -> str:
     if not isinstance(batch_metadata, dict):
         raise RolloutBufferCheckpointError("rollout buffer batch metadata must be an object")
 
     expected_fields = {"filename", "policy_version", "generation_step", "size_bytes", "sha256"}
     if set(batch_metadata) != expected_fields:
         raise RolloutBufferCheckpointError("rollout buffer batch metadata has unexpected fields")
-    if batch_metadata["filename"] != f"batch_{index}.pkl":
+    filename = batch_metadata["filename"]
+    if not isinstance(filename, str):
+        raise RolloutBufferCheckpointError("rollout buffer batch filename is invalid")
+    filename_match = _BATCH_FILENAME_PATTERN.fullmatch(filename)
+    if filename_match is None or int(filename_match.group(2)) != index:
         raise RolloutBufferCheckpointError("rollout buffer batch filename is out of order")
+    batch_snapshot_id = filename_match.group(1)
+    if snapshot_id is not None and batch_snapshot_id != snapshot_id:
+        raise RolloutBufferCheckpointError("rollout buffer batches belong to different snapshots")
     if not _is_int(batch_metadata["policy_version"]):
         raise RolloutBufferCheckpointError("rollout buffer policy version must be an integer")
     if not _is_int(batch_metadata["generation_step"]):
@@ -204,6 +219,7 @@ def _validate_batch_metadata(batch_metadata: object, index: int) -> None:
         int(checksum, 16)
     except ValueError as error:
         raise RolloutBufferCheckpointError("rollout buffer batch checksum is invalid") from error
+    return batch_snapshot_id
 
 
 def _validate_batch_file(batch_path: Path, batch_metadata: dict) -> None:
@@ -233,6 +249,15 @@ def _load_buffered_rollout(batch_path: Path, batch_metadata: dict) -> BufferedRo
     ):
         raise RolloutBufferCheckpointError("rollout buffer batch payload metadata does not match manifest")
     return buffered_rollout
+
+
+def _remove_obsolete_batch_files(checkpoint_directory: Path, current_filenames: set[str]) -> None:
+    for batch_path in checkpoint_directory.glob("batch_*.pkl"):
+        if batch_path.name not in current_filenames:
+            try:
+                batch_path.unlink()
+            except OSError:
+                pass
 
 
 def _is_int(value: object) -> bool:

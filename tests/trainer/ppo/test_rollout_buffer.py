@@ -13,11 +13,13 @@
 # limitations under the License.
 
 import json
+from pathlib import Path
 
 import pytest
 import torch
 
 from verl import DataProto
+from verl.trainer.ppo import rollout_buffer
 from verl.trainer.ppo.rollout_buffer import FixedDelayRolloutBuffer, RolloutBufferCheckpointError
 
 
@@ -80,6 +82,10 @@ def _save_checkpoint(tmp_path):
     return checkpoint_directory
 
 
+def _read_manifest(checkpoint_directory):
+    return json.loads((checkpoint_directory / "manifest.json").read_text())
+
+
 def test_checkpoint_round_trip_preserves_queue_and_generation_step(tmp_path):
     checkpoint_directory = _save_checkpoint(tmp_path)
 
@@ -101,7 +107,7 @@ def test_checkpoint_round_trip_preserves_queue_and_generation_step(tmp_path):
 
 def test_checkpoint_rejects_corrupted_batch(tmp_path):
     checkpoint_directory = _save_checkpoint(tmp_path)
-    batch_path = checkpoint_directory / "batch_0.pkl"
+    batch_path = checkpoint_directory / _read_manifest(checkpoint_directory)["batches"][0]["filename"]
     contents = bytearray(batch_path.read_bytes())
     contents[-1] ^= 0xFF
     batch_path.write_bytes(contents)
@@ -114,7 +120,7 @@ def test_checkpoint_rejects_corrupted_batch(tmp_path):
 def test_checkpoint_rejects_delay_mismatch(tmp_path):
     checkpoint_directory = _save_checkpoint(tmp_path)
     manifest_path = checkpoint_directory / "manifest.json"
-    manifest = json.loads(manifest_path.read_text())
+    manifest = _read_manifest(checkpoint_directory)
     manifest["delay_steps"] = 3
     manifest_path.write_text(json.dumps(manifest))
 
@@ -125,7 +131,8 @@ def test_checkpoint_rejects_delay_mismatch(tmp_path):
 
 def test_checkpoint_rejects_missing_batch(tmp_path):
     checkpoint_directory = _save_checkpoint(tmp_path)
-    (checkpoint_directory / "batch_1.pkl").unlink()
+    manifest = _read_manifest(checkpoint_directory)
+    (checkpoint_directory / manifest["batches"][1]["filename"]).unlink()
 
     restored = FixedDelayRolloutBuffer(delay_steps=2)
     with pytest.raises(RolloutBufferCheckpointError):
@@ -138,3 +145,45 @@ def test_checkpoint_rejects_unexpected_checkpoint_step(tmp_path):
     restored = FixedDelayRolloutBuffer(delay_steps=2)
     with pytest.raises(RolloutBufferCheckpointError):
         restored.load_from_directory(checkpoint_directory, expected_checkpoint_step=6)
+
+
+def test_interrupted_resave_leaves_previous_checkpoint_loadable(tmp_path, monkeypatch):
+    checkpoint_directory = _save_checkpoint(tmp_path)
+    replacement = FixedDelayRolloutBuffer(delay_steps=2)
+    replacement.push(make_batch(21), policy_version=7, generation_step=10)
+    replacement.push(make_batch(22), policy_version=8, generation_step=11)
+    original_replace = rollout_buffer.os.replace
+    published_batch_count = 0
+
+    def interrupt_second_batch_publish(source, destination):
+        nonlocal published_batch_count
+        if Path(destination).name.startswith("batch_"):
+            published_batch_count += 1
+            if published_batch_count == 2:
+                raise OSError("simulated interruption")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(rollout_buffer.os, "replace", interrupt_second_batch_publish)
+
+    with pytest.raises(OSError, match="simulated interruption"):
+        replacement.save_to_directory(checkpoint_directory, checkpoint_step=6, generation_step=11)
+
+    restored = FixedDelayRolloutBuffer(delay_steps=2)
+    assert restored.load_from_directory(checkpoint_directory, expected_checkpoint_step=5) == 9
+    released = restored.push(make_batch(13), policy_version=5, generation_step=10)
+    assert released is not None
+    assert released.batch.batch["value"].item() == 11
+    assert released.policy_version == 3
+    assert released.generation_step == 8
+
+
+def test_checkpoint_rejects_incomplete_fixed_delay_queue(tmp_path):
+    checkpoint_directory = _save_checkpoint(tmp_path)
+    manifest_path = checkpoint_directory / "manifest.json"
+    manifest = _read_manifest(checkpoint_directory)
+    manifest["batches"].pop()
+    manifest_path.write_text(json.dumps(manifest))
+
+    restored = FixedDelayRolloutBuffer(delay_steps=2)
+    with pytest.raises(RolloutBufferCheckpointError):
+        restored.load_from_directory(checkpoint_directory, expected_checkpoint_step=5)
