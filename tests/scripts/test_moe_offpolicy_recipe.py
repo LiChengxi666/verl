@@ -24,6 +24,24 @@ OFFPOLICY_CONFIG = REPO_ROOT / "training_jobs/configs/train_gspo_qwen3_30b_a3b_o
 FORMAL_SCRIPT = REPO_ROOT / "training_jobs/scripts/run_gspo_qwen3_30b_a3b_offpolicy_8gpu_200.sh"
 
 
+def _hydra_overrides(script_path: Path) -> dict[str, str]:
+    overrides = {}
+    in_command = False
+    for raw_line in script_path.read_text().splitlines():
+        line = raw_line.strip()
+        if line == "python -m verl.trainer.main_ppo \\":
+            in_command = True
+            continue
+        if not in_command:
+            continue
+        line = line.removesuffix(" \\")
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        overrides[key.removeprefix("+")] = value
+    return overrides
+
+
 def test_offpolicy_recipe_uses_two_step_behavior_policy_rollouts():
     base_script = BASE_SCRIPT.read_text()
     offpolicy_script = OFFPOLICY_SCRIPT.read_text()
@@ -82,13 +100,34 @@ def test_formal_offpolicy_recipe_matches_paper_and_storage_contract():
         "trainer.test_freq=5",
         "trainer.save_freq=5",
         'trainer.total_training_steps="${TOTAL_TRAINING_STEPS}"',
-        'WANDB_ENTITY="${WANDB_ENTITY:-licx199}"',
         "wandb",
         'if [ ! -f "${MODEL_PATH}/config.json" ]',
         'if [ ! -f "${TRAIN_FILE}" ]',
     ]
     for fragment in expected_fragments:
         assert fragment in script
+
+    assert 'WANDB_ENTITY="${WANDB_ENTITY:-licx199}"' not in script
+
+
+def test_formal_recipe_only_changes_documented_scale_settings_from_smoke():
+    smoke = _hydra_overrides(OFFPOLICY_SCRIPT)
+    formal = _hydra_overrides(FORMAL_SCRIPT)
+    differences = {
+        key: (smoke.get(key), formal.get(key))
+        for key in smoke.keys() | formal.keys()
+        if smoke.get(key) != formal.get(key)
+    }
+
+    assert differences == {
+        "actor_rollout_ref.actor.optim.lr_warmup_steps": ("2", "10"),
+        "actor_rollout_ref.actor.ppo_mini_batch_size": ("8", "32"),
+        "data.train_batch_size": ("16", "512"),
+        "trainer.max_actor_ckpt_to_keep": ("2", "null"),
+        "trainer.max_critic_ckpt_to_keep": ("2", "null"),
+        "trainer.save_freq": ("3", "5"),
+        "trainer.test_freq": ("3", "5"),
+    }
 
 
 def test_formal_offpolicy_recipe_has_portable_runbook():

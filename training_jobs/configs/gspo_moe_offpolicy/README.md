@@ -153,6 +153,8 @@ export WANDB_API_KEY_FILE=./.secrets/wandb_api_key
 
 默认 project 为 `verl_moe`，run name 为 `gspo_moe_offpolicy_n2_8gpu_200`。
 没有配置 key 时，脚本会使用 `console,file,tensorboard`，不会因 W&B 登录失败而退出。
+`WANDB_ENTITY` 为可选项；仅在确认 team/entity 名称有效时设置，否则保持未设置，
+由 W&B 根据 API key 自动选择默认 entity。
 
 外场 recipe 不包含内部平台的队列、挂载和个人路径配置。资源和存储由外场平台
 单独配置，bash 入口及其所有文件参数均以仓库根目录为基准使用相对路径。

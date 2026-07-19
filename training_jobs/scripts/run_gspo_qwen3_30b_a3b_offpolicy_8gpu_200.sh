@@ -56,7 +56,6 @@ export WANDB_DIR="${LOG_DIR}/wandb"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
 export WANDB_RUN_ID="${WANDB_RUN_ID:-${EXPERIMENT_NAME}}"
-export WANDB_ENTITY="${WANDB_ENTITY:-licx199}"
 export WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-./.secrets/wandb_api_key}"
 
 if [ -z "${TRAINER_LOGGER:-}" ]; then
