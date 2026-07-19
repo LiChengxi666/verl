@@ -1,6 +1,6 @@
 # GSPO MoE Off-policy Baseline
 
-本 recipe 用于在单机 8 张 A100 80G 上训练 `Qwen3-30B-A3B-Base`。训练算法为
+本 recipe 用于在 2 个节点、每节点 4 张 A100 80G 上训练 `Qwen3-30B-A3B-Base`。训练算法为
 GSPO，并使用固定延迟为 2 的 rollout buffer 构造 off-policy 数据。验证集为
 AMC23、AIME24 和 AIME25，每题采样 8 个回答。
 
@@ -36,11 +36,11 @@ gensi-cn-beijing.cr.volces.com/sia-thu/verl:v0
 资源要求：
 
 ```text
-1 节点 x 8 张 NVIDIA A100 80G
+2 节点 x 4 张 NVIDIA A100 80G
 ```
 
-脚本默认使用 `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`，并检查 Ray 集群是否
-注册到 8 张 GPU。
+脚本在每个节点默认使用 `CUDA_VISIBLE_DEVICES=0,1,2,3`，并检查 Ray 集群是否
+总共注册到 8 张 GPU。
 
 ## 模型和数据
 
@@ -112,7 +112,7 @@ clip low/high = 0.002 / 0.002
 learning rate = 1e-6
 ppo mini-batch size = 32
 ppo epochs = 1
-rollout TP / DP / EP = 4 / 2 / 8
+rollout TP / DP / EP = 4 / 1 / 4
 off-policy delay = 2
 total training steps = 200
 test frequency = 5

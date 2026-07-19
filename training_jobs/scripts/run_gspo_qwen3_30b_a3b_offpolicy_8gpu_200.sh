@@ -13,18 +13,18 @@ export TRANSFORMERS_OFFLINE=1
 export VLLM_USE_V1=1
 export VLLM_ENABLE_V1_MULTIPROCESSING=0
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export MLP_ROLE_INDEX="${MLP_ROLE_INDEX:-0}"
-export MLP_WORKER_NUM="${MLP_WORKER_NUM:-1}"
-export MLP_WORKER_GPU="${MLP_WORKER_GPU:-8}"
+export MLP_WORKER_NUM="${MLP_WORKER_NUM:-2}"
+export MLP_WORKER_GPU="${MLP_WORKER_GPU:-4}"
 export MLP_WORKER_0_HOST="${MLP_WORKER_0_HOST:-127.0.0.1}"
 
 export MODEL_PATH="${MODEL_PATH:-./models/Qwen3-30B-A3B-Base}"
 export TRAIN_FILE="${TRAIN_FILE:-./data/data_processed/math-17k.parquet}"
 export VAL_FILES="${VAL_FILES:-[\"./data/data_processed/moe_eval/minpro/amc23.parquet\",\"./data/data_processed/moe_eval/minpro/aime24.parquet\",\"./data/data_processed/moe_eval/minpro/aime25.parquet\"]}"
 export ROLLOUT_TP="${ROLLOUT_TP:-4}"
-export ROLLOUT_DP="${ROLLOUT_DP:-2}"
-export ROLLOUT_EP="${ROLLOUT_EP:-8}"
+export ROLLOUT_DP="${ROLLOUT_DP:-1}"
+export ROLLOUT_EP="${ROLLOUT_EP:-4}"
 export MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
 export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-20480}"
 export OVERLONG_BUFFER_ENABLE="${OVERLONG_BUFFER_ENABLE:-False}"
@@ -130,8 +130,8 @@ print(
 assert config.model_type == "qwen3_moe"
 assert getattr(config, "num_experts", None) == 128
 assert "fsdp" in EngineRegistry._engines["language_model"]
-assert int(os.environ["MLP_WORKER_NUM"]) == 1
-assert int(os.environ["MLP_WORKER_GPU"]) == 8
+assert int(os.environ["MLP_WORKER_NUM"]) == 2
+assert int(os.environ["MLP_WORKER_GPU"]) == 4
 assert int(os.environ["ROLLOUT_EP"]) == int(os.environ["ROLLOUT_TP"]) * int(os.environ["ROLLOUT_DP"])
 assert int(os.environ["MAX_RESPONSE_LENGTH"]) >= int(os.environ["OVERLONG_BUFFER_LEN"])
 

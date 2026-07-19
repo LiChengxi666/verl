@@ -71,10 +71,10 @@ def test_formal_offpolicy_recipe_matches_paper_and_storage_contract():
     assert "/GenSIvePFS/users/cxli" not in script
 
     expected_fragments = [
-        'MLP_WORKER_NUM="${MLP_WORKER_NUM:-1}"',
-        'MLP_WORKER_GPU="${MLP_WORKER_GPU:-8}"',
-        'ROLLOUT_DP="${ROLLOUT_DP:-2}"',
-        'ROLLOUT_EP="${ROLLOUT_EP:-8}"',
+        'MLP_WORKER_NUM="${MLP_WORKER_NUM:-2}"',
+        'MLP_WORKER_GPU="${MLP_WORKER_GPU:-4}"',
+        'ROLLOUT_DP="${ROLLOUT_DP:-1}"',
+        'ROLLOUT_EP="${ROLLOUT_EP:-4}"',
         "data/data_processed/math-17k.parquet",
         "data/data_processed/moe_eval/minpro/amc23.parquet",
         "data/data_processed/moe_eval/minpro/aime24.parquet",
