@@ -1,6 +1,6 @@
 # GSPO MoE Off-policy Baseline
 
-本 recipe 用于在 2 个节点、每节点 4 张 A100 80G 上训练 `Qwen3-30B-A3B-Base`。训练算法为
+本 recipe 用于在 4 个节点、每节点 4 张 A100 80G 上训练 `Qwen3-30B-A3B-Base`。训练算法为
 GSPO，并使用固定延迟为 2 的 rollout buffer 构造 off-policy 数据。验证集为
 AMC23、AIME24 和 AIME25，每题采样 8 个回答。
 
@@ -36,11 +36,12 @@ gensi-cn-beijing.cr.volces.com/sia-thu/verl:v0
 资源要求：
 
 ```text
-2 节点 x 4 张 NVIDIA A100 80G
+4 节点 x 4 张 NVIDIA A100 80G（共 16 张）
 ```
 
 脚本在每个节点默认使用 `CUDA_VISIBLE_DEVICES=0,1,2,3`，并检查 Ray 集群是否
-总共注册到 8 张 GPU。
+总共注册到 16 张 GPU。actor 的 FSDP size 默认按总 GPU 数计算，因此该配置为 16；
+rollout 仍使用 TP/DP/EP = 4/1/4。
 
 ## 模型和数据
 
@@ -88,7 +89,7 @@ bash training_jobs/scripts/run_gspo_qwen3_30b_a3b_offpolicy_8gpu_200.sh
 
 ```bash
 OUTPUT_ROOT=./outputs \
-EXPERIMENT_NAME=gspo_moe_offpolicy_n2_8gpu_200 \
+EXPERIMENT_NAME=gspo_moe_offpolicy_n2_16gpu_200 \
 bash training_jobs/scripts/run_gspo_qwen3_30b_a3b_offpolicy_8gpu_200.sh
 ```
 
@@ -112,6 +113,7 @@ clip low/high = 0.002 / 0.002
 learning rate = 1e-6
 ppo mini-batch size = 32
 ppo epochs = 1
+actor FSDP size = 16
 rollout TP / DP / EP = 4 / 1 / 4
 off-policy delay = 2
 total training steps = 200
@@ -151,7 +153,7 @@ printf '%s\n' 'your-api-key' > .secrets/wandb_api_key
 export WANDB_API_KEY_FILE=./.secrets/wandb_api_key
 ```
 
-默认 project 为 `verl_moe`，run name 为 `gspo_moe_offpolicy_n2_8gpu_200`。
+默认 project 为 `verl_moe`，run name 为 `gspo_moe_offpolicy_n2_16gpu_200`。
 没有配置 key 时，脚本会使用 `console,file,tensorboard`，不会因 W&B 登录失败而退出。
 `WANDB_ENTITY` 为可选项；仅在确认 team/entity 名称有效时设置，否则保持未设置，
 由 W&B 根据 API key 自动选择默认 entity。

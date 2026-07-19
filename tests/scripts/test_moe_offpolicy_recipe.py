@@ -22,6 +22,7 @@ BASE_SCRIPT = REPO_ROOT / "training_jobs/scripts/run_gspo_qwen3_30b_a3b_smoke.sh
 OFFPOLICY_SCRIPT = REPO_ROOT / "training_jobs/scripts/run_gspo_qwen3_30b_a3b_offpolicy_smoke.sh"
 OFFPOLICY_CONFIG = REPO_ROOT / "training_jobs/configs/train_gspo_qwen3_30b_a3b_offpolicy_smoke_config.yaml"
 FORMAL_SCRIPT = REPO_ROOT / "training_jobs/scripts/run_gspo_qwen3_30b_a3b_offpolicy_8gpu_200.sh"
+FORMAL_CONFIG = REPO_ROOT / "training_jobs/configs/train_gspo_qwen3_30b_a3b_offpolicy_8gpu_200_config.yaml"
 
 
 def _hydra_overrides(script_path: Path) -> dict[str, str]:
@@ -71,8 +72,9 @@ def test_formal_offpolicy_recipe_matches_paper_and_storage_contract():
     assert "/GenSIvePFS/users/cxli" not in script
 
     expected_fragments = [
-        'MLP_WORKER_NUM="${MLP_WORKER_NUM:-2}"',
+        'MLP_WORKER_NUM="${MLP_WORKER_NUM:-4}"',
         'MLP_WORKER_GPU="${MLP_WORKER_GPU:-4}"',
+        'ACTOR_FSDP_SIZE="${ACTOR_FSDP_SIZE:-$((MLP_WORKER_NUM * MLP_WORKER_GPU))}"',
         'ROLLOUT_DP="${ROLLOUT_DP:-1}"',
         'ROLLOUT_EP="${ROLLOUT_EP:-4}"',
         "data/data_processed/math-17k.parquet",
@@ -93,6 +95,7 @@ def test_formal_offpolicy_recipe_matches_paper_and_storage_contract():
         "actor_rollout_ref.actor.clip_ratio_low=0.002",
         "actor_rollout_ref.actor.clip_ratio_high=0.002",
         "actor_rollout_ref.actor.ppo_mini_batch_size=32",
+        'actor_rollout_ref.actor.fsdp_config.fsdp_size="${ACTOR_FSDP_SIZE}"',
         "actor_rollout_ref.actor.optim.lr_warmup_steps=10",
         "actor_rollout_ref.rollout.n=8",
         'actor_rollout_ref.rollout.val_kwargs.n="${VAL_N}"',
@@ -110,6 +113,18 @@ def test_formal_offpolicy_recipe_matches_paper_and_storage_contract():
     assert 'WANDB_ENTITY="${WANDB_ENTITY:-licx199}"' not in script
 
 
+def test_formal_offpolicy_config_requests_four_by_four_a100s():
+    config = yaml.safe_load(FORMAL_CONFIG.read_text())
+
+    assert config["TaskName"] == "gspo-moe-offpolicy-n2-16gpu-200"
+    assert config["TaskRoleSpecs"] == [
+        {"RoleName": "worker", "RoleReplicas": 4, "Flavor": "ml.pni2.14xlarge"}
+    ]
+    envs = {item["Name"]: item["Value"] for item in config["Envs"]}
+    assert envs["EXPERIMENT_NAME"] == "gspo_moe_offpolicy_n2_16gpu_200"
+    assert envs["RUN_ID"] == "gspo_moe_offpolicy_n2_16gpu_200"
+
+
 def test_formal_recipe_only_changes_documented_scale_settings_from_smoke():
     smoke = _hydra_overrides(OFFPOLICY_SCRIPT)
     formal = _hydra_overrides(FORMAL_SCRIPT)
@@ -120,6 +135,7 @@ def test_formal_recipe_only_changes_documented_scale_settings_from_smoke():
     }
 
     assert differences == {
+        "actor_rollout_ref.actor.fsdp_config.fsdp_size": ("8", '"${ACTOR_FSDP_SIZE}"'),
         "actor_rollout_ref.actor.optim.lr_warmup_steps": ("2", "10"),
         "actor_rollout_ref.actor.ppo_mini_batch_size": ("8", "32"),
         "data.train_batch_size": ("16", "512"),

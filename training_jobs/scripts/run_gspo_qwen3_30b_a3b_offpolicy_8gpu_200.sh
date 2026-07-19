@@ -15,9 +15,10 @@ export VLLM_ENABLE_V1_MULTIPROCESSING=0
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export MLP_ROLE_INDEX="${MLP_ROLE_INDEX:-0}"
-export MLP_WORKER_NUM="${MLP_WORKER_NUM:-2}"
+export MLP_WORKER_NUM="${MLP_WORKER_NUM:-4}"
 export MLP_WORKER_GPU="${MLP_WORKER_GPU:-4}"
 export MLP_WORKER_0_HOST="${MLP_WORKER_0_HOST:-127.0.0.1}"
+export ACTOR_FSDP_SIZE="${ACTOR_FSDP_SIZE:-$((MLP_WORKER_NUM * MLP_WORKER_GPU))}"
 
 export MODEL_PATH="${MODEL_PATH:-./models/Qwen3-30B-A3B-Base}"
 export TRAIN_FILE="${TRAIN_FILE:-./data/data_processed/math-17k.parquet}"
@@ -35,7 +36,7 @@ export MAX_MODEL_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-200}"
 
 export PROJECT_NAME="${PROJECT_NAME:-verl_moe}"
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-gspo_moe_offpolicy_n2_8gpu_200}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-gspo_moe_offpolicy_n2_16gpu_200}"
 export OUTPUT_ROOT="${OUTPUT_ROOT:-.}"
 export CKPT_ROOT="${CKPT_ROOT:-${OUTPUT_ROOT}/checkpoints}"
 export CKPT_DIR=${CKPT_ROOT}/${PROJECT_NAME}/${EXPERIMENT_NAME}
@@ -130,8 +131,9 @@ print(
 assert config.model_type == "qwen3_moe"
 assert getattr(config, "num_experts", None) == 128
 assert "fsdp" in EngineRegistry._engines["language_model"]
-assert int(os.environ["MLP_WORKER_NUM"]) == 2
+assert int(os.environ["MLP_WORKER_NUM"]) == 4
 assert int(os.environ["MLP_WORKER_GPU"]) == 4
+assert int(os.environ["ACTOR_FSDP_SIZE"]) == int(os.environ["MLP_WORKER_NUM"]) * int(os.environ["MLP_WORKER_GPU"])
 assert int(os.environ["ROLLOUT_EP"]) == int(os.environ["ROLLOUT_TP"]) * int(os.environ["ROLLOUT_DP"])
 assert int(os.environ["MAX_RESPONSE_LENGTH"]) >= int(os.environ["OVERLONG_BUFFER_LEN"])
 
@@ -259,7 +261,7 @@ PY
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.0 \
     actor_rollout_ref.actor.entropy_coeff=0 \
-    actor_rollout_ref.actor.fsdp_config.fsdp_size=8 \
+    actor_rollout_ref.actor.fsdp_config.fsdp_size="${ACTOR_FSDP_SIZE}" \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=4 \
