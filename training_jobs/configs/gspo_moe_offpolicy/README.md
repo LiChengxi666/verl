@@ -20,7 +20,6 @@ verl/trainer/ppo/rollout_buffer.py
 verl/trainer/ppo/ray_trainer.py
 verl/trainer/config/ppo_trainer.yaml
 training_jobs/scripts/run_gspo_qwen3_30b_a3b_offpolicy_8gpu_200.sh
-training_jobs/configs/train_gspo_qwen3_30b_a3b_offpolicy_8gpu_200_config.yaml
 ```
 
 ## 环境与资源
@@ -64,12 +63,12 @@ huggingface-cli download Qwen/Qwen3-30B-A3B-Base \
   --local-dir-use-symlinks False
 ```
 
-如果路径不同，使用环境变量覆盖：
+如果文件放在仓库内的其他相对路径，使用环境变量覆盖：
 
 ```bash
-export MODEL_PATH=/path/to/Qwen3-30B-A3B-Base
-export TRAIN_FILE=/path/to/math-17k.parquet
-export VAL_FILES='["/path/to/amc23.parquet","/path/to/aime24.parquet","/path/to/aime25.parquet"]'
+export MODEL_PATH=./assets/models/Qwen3-30B-A3B-Base
+export TRAIN_FILE=./assets/data/math-17k.parquet
+export VAL_FILES='["./assets/data/amc23.parquet","./assets/data/aime24.parquet","./assets/data/aime25.parquet"]'
 ```
 
 processed MATH 数据使用 0/1 correctness reward。验证 parquet 需要包含
@@ -88,15 +87,15 @@ bash training_jobs/scripts/run_gspo_qwen3_30b_a3b_offpolicy_8gpu_200.sh
 如果训练输出需要写到共享存储：
 
 ```bash
-OUTPUT_ROOT=/path/to/shared/storage \
+OUTPUT_ROOT=./outputs \
 EXPERIMENT_NAME=gspo_moe_offpolicy_n2_8gpu_200 \
 bash training_jobs/scripts/run_gspo_qwen3_30b_a3b_offpolicy_8gpu_200.sh
 ```
 
-外场平台只允许填写一条入口命令时使用：
+外场平台只允许填写一条入口命令时，在仓库根目录使用：
 
 ```bash
-cd "${WORKSPACE}/verl" && OUTPUT_ROOT=/path/to/shared/storage bash training_jobs/scripts/run_gspo_qwen3_30b_a3b_offpolicy_8gpu_200.sh
+OUTPUT_ROOT=./outputs bash training_jobs/scripts/run_gspo_qwen3_30b_a3b_offpolicy_8gpu_200.sh
 ```
 
 ## 默认训练设置
@@ -149,14 +148,11 @@ export WANDB_API_KEY=...
 ```bash
 mkdir -p .secrets
 printf '%s\n' 'your-api-key' > .secrets/wandb_api_key
-export WANDB_API_KEY_FILE="${PWD}/.secrets/wandb_api_key"
+export WANDB_API_KEY_FILE=./.secrets/wandb_api_key
 ```
 
 默认 project 为 `verl_moe`，run name 为 `gspo_moe_offpolicy_n2_8gpu_200`。
 没有配置 key 时，脚本会使用 `console,file,tensorboard`，不会因 W&B 登录失败而退出。
 
-## 火山 MLP 配置
-
-`train_gspo_qwen3_30b_a3b_offpolicy_8gpu_200_config.yaml` 是当前火山平台配置参考。
-迁移到其他平台时需修改队列、实例规格、存储挂载和入口路径。外场通用启动逻辑在
-bash 脚本中，不依赖个人绝对路径。
+外场 recipe 不包含内部平台的队列、挂载和个人路径配置。资源和存储由外场平台
+单独配置，bash 入口及其所有文件参数均以仓库根目录为基准使用相对路径。

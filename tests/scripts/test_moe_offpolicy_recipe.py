@@ -22,7 +22,6 @@ BASE_SCRIPT = REPO_ROOT / "training_jobs/scripts/run_gspo_qwen3_30b_a3b_smoke.sh
 OFFPOLICY_SCRIPT = REPO_ROOT / "training_jobs/scripts/run_gspo_qwen3_30b_a3b_offpolicy_smoke.sh"
 OFFPOLICY_CONFIG = REPO_ROOT / "training_jobs/configs/train_gspo_qwen3_30b_a3b_offpolicy_smoke_config.yaml"
 FORMAL_SCRIPT = REPO_ROOT / "training_jobs/scripts/run_gspo_qwen3_30b_a3b_offpolicy_8gpu_200.sh"
-FORMAL_CONFIG = REPO_ROOT / "training_jobs/configs/train_gspo_qwen3_30b_a3b_offpolicy_8gpu_200_config.yaml"
 
 
 def test_offpolicy_recipe_uses_two_step_behavior_policy_rollouts():
@@ -68,6 +67,9 @@ def test_formal_offpolicy_recipe_matches_paper_and_storage_contract():
         'VAL_N="${VAL_N:-8}"',
         'TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-200}"',
         'REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"',
+        'MODEL_PATH="${MODEL_PATH:-./models/Qwen3-30B-A3B-Base}"',
+        'TRAIN_FILE="${TRAIN_FILE:-./data/data_processed/math-17k.parquet}"',
+        'OUTPUT_ROOT="${OUTPUT_ROOT:-.}"',
         'CKPT_ROOT="${CKPT_ROOT:-${OUTPUT_ROOT}/checkpoints}"',
         "actor_rollout_ref.actor.policy_loss.loss_mode=gspo",
         "actor_rollout_ref.actor.clip_ratio_low=0.002",
@@ -97,27 +99,5 @@ def test_formal_offpolicy_recipe_has_portable_runbook():
     assert "Qwen3-30B-A3B-Base" in contents
     assert "rollout queue" in contents
     assert "policy lag 2" in contents
-
-
-def test_formal_offpolicy_config_requests_one_eight_gpu_worker_with_retry():
-    config = yaml.safe_load(FORMAL_CONFIG.read_text())
-
-    assert config["Entrypoint"].endswith("run_gspo_qwen3_30b_a3b_offpolicy_8gpu_200.sh")
-    assert config["TaskRoleSpecs"] == [
-        {"RoleName": "worker", "RoleReplicas": 1, "Flavor": "ml.pni2.28xlarge"}
-    ]
-    assert config["RetryOptions"]["EnableRetry"] is True
-    assert config["RetryOptions"]["EnableReserveResourceOnRetry"] is True
-    assert config["EnableTensorBoard"] is True
-    envs = {item["Name"]: item["Value"] for item in config["Envs"]}
-    assert envs["MODEL_PATH"] == "/GenSIvePFS/users/cxli/models/Qwen3-30B-A3B-Base"
-    assert envs["OUTPUT_ROOT"] == "/GenSIvePFS/users/cxli/verl"
-    assert envs["WANDB_API_KEY_FILE"] == "/GenSIvePFS/users/cxli/.secrets/wandb_api_key"
-    assert config["Storages"] == [
-        {
-            "Type": "Vepfs",
-            "MountPath": "/GenSIvePFS/users/cxli",
-            "SubPath": "users/cxli",
-            "ReadOnly": False,
-        }
-    ]
+    assert "/path/to" not in contents
+    assert "${WORKSPACE}" not in contents

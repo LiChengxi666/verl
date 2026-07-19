@@ -19,9 +19,9 @@ export MLP_WORKER_NUM="${MLP_WORKER_NUM:-1}"
 export MLP_WORKER_GPU="${MLP_WORKER_GPU:-8}"
 export MLP_WORKER_0_HOST="${MLP_WORKER_0_HOST:-127.0.0.1}"
 
-export MODEL_PATH="${MODEL_PATH:-${REPO_ROOT}/models/Qwen3-30B-A3B-Base}"
-export TRAIN_FILE="${TRAIN_FILE:-${REPO_ROOT}/data/data_processed/math-17k.parquet}"
-export VAL_FILES="${VAL_FILES:-[\"${REPO_ROOT}/data/data_processed/moe_eval/minpro/amc23.parquet\",\"${REPO_ROOT}/data/data_processed/moe_eval/minpro/aime24.parquet\",\"${REPO_ROOT}/data/data_processed/moe_eval/minpro/aime25.parquet\"]}"
+export MODEL_PATH="${MODEL_PATH:-./models/Qwen3-30B-A3B-Base}"
+export TRAIN_FILE="${TRAIN_FILE:-./data/data_processed/math-17k.parquet}"
+export VAL_FILES="${VAL_FILES:-[\"./data/data_processed/moe_eval/minpro/amc23.parquet\",\"./data/data_processed/moe_eval/minpro/aime24.parquet\",\"./data/data_processed/moe_eval/minpro/aime25.parquet\"]}"
 export ROLLOUT_TP="${ROLLOUT_TP:-4}"
 export ROLLOUT_DP="${ROLLOUT_DP:-2}"
 export ROLLOUT_EP="${ROLLOUT_EP:-8}"
@@ -36,7 +36,7 @@ export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-200}"
 
 export PROJECT_NAME="${PROJECT_NAME:-verl_moe}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-gspo_moe_offpolicy_n2_8gpu_200}"
-export OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}}"
+export OUTPUT_ROOT="${OUTPUT_ROOT:-.}"
 export CKPT_ROOT="${CKPT_ROOT:-${OUTPUT_ROOT}/checkpoints}"
 export CKPT_DIR=${CKPT_ROOT}/${PROJECT_NAME}/${EXPERIMENT_NAME}
 export LOG_DIR="${LOG_DIR:-${OUTPUT_ROOT}/train_logs/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
@@ -57,7 +57,7 @@ export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
 export WANDB_RUN_ID="${WANDB_RUN_ID:-${EXPERIMENT_NAME}}"
 export WANDB_ENTITY="${WANDB_ENTITY:-licx199}"
-export WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-${REPO_ROOT}/.secrets/wandb_api_key}"
+export WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-./.secrets/wandb_api_key}"
 
 if [ -z "${TRAINER_LOGGER:-}" ]; then
   if [ -n "${WANDB_API_KEY:-}" ] || [ -r "${WANDB_API_KEY_FILE}" ]; then
