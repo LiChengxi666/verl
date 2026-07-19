@@ -82,6 +82,8 @@ def test_formal_offpolicy_recipe_matches_paper_and_storage_contract():
         'trainer.total_training_steps="${TOTAL_TRAINING_STEPS}"',
         'WANDB_ENTITY="${WANDB_ENTITY:-licx199}"',
         "wandb",
+        'if [ ! -f "${MODEL_PATH}/config.json" ]',
+        'if [ ! -f "${TRAIN_FILE}" ]',
     ]
     for fragment in expected_fragments:
         assert fragment in script

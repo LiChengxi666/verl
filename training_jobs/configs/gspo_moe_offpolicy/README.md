@@ -74,6 +74,8 @@ export VAL_FILES='["/path/to/amc23.parquet","/path/to/aime24.parquet","/path/to/
 
 processed MATH 数据使用 0/1 correctness reward。验证 parquet 需要包含
 `data_source`、`prompt` 和 `reward_model` 字段；入口脚本会在启动 Ray 前检查。
+模型目录必须包含 `config.json`；路径错误时脚本会在加载 transformers 前直接退出并
+打印需要覆盖的环境变量。
 
 ## 启动
 

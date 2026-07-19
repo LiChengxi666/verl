@@ -79,6 +79,25 @@ if [[ "${TRAINER_LOGGER}" == *wandb* ]] && [ -z "${WANDB_API_KEY:-}" ]; then
 fi
 mkdir -p "${WANDB_DIR}"
 
+if [ ! -f "${MODEL_PATH}/config.json" ]; then
+  echo "MODEL_PATH does not contain config.json: ${MODEL_PATH}" >&2
+  echo "Set MODEL_PATH to the prepared Qwen3-30B-A3B-Base directory." >&2
+  exit 1
+fi
+if [ ! -f "${TRAIN_FILE}" ]; then
+  echo "TRAIN_FILE does not exist: ${TRAIN_FILE}" >&2
+  exit 1
+fi
+python - <<'PY'
+import json
+import os
+from pathlib import Path
+
+missing = [path for path in json.loads(os.environ["VAL_FILES"]) if not Path(path).is_file()]
+if missing:
+    raise SystemExit(f"Validation files do not exist: {missing}")
+PY
+
 which python
 python - <<'PY'
 import json
