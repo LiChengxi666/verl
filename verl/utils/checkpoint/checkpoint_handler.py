@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
 
 # TODO: add unit tests
 
@@ -20,6 +21,7 @@ import logging
 import os
 import re
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -27,7 +29,9 @@ import verl.utils.hdfs_io as hdfs_io
 from verl.single_controller import WorkerGroup
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, get_checkpoint_tracker_filename
 from verl.utils.logger import log_with_rank
-from verl.workers.engine import BaseEngine
+
+if TYPE_CHECKING:
+    from verl.workers.engine import BaseEngine
 
 
 def extract_step(path):
