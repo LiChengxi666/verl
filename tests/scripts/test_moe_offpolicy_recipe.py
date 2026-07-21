@@ -22,7 +22,9 @@ BASE_SCRIPT = REPO_ROOT / "training_jobs/scripts/run_gspo_qwen3_30b_a3b_smoke.sh
 OFFPOLICY_SCRIPT = REPO_ROOT / "training_jobs/scripts/run_gspo_qwen3_30b_a3b_offpolicy_smoke.sh"
 OFFPOLICY_CONFIG = REPO_ROOT / "training_jobs/configs/train_gspo_qwen3_30b_a3b_offpolicy_smoke_config.yaml"
 FORMAL_SCRIPT = REPO_ROOT / "training_jobs/scripts/run_gspo_qwen3_30b_a3b_offpolicy_8gpu_200.sh"
+REDUCED_FORMAL_SCRIPT = REPO_ROOT / "training_jobs/scripts/run_gspo_qwen3_30b_a3b_offpolicy_16gpu_b64n8_r8192.sh"
 FORMAL_CONFIG = REPO_ROOT / "training_jobs/configs/train_gspo_qwen3_30b_a3b_offpolicy_8gpu_200_config.yaml"
+REDUCED_FORMAL_CONFIG = REPO_ROOT / "training_jobs/configs/train_gspo_qwen3_30b_a3b_offpolicy_16gpu_b64n8_r8192_config.yaml"
 
 
 def _hydra_overrides(script_path: Path) -> dict[str, str]:
@@ -123,6 +125,32 @@ def test_formal_offpolicy_config_requests_four_by_four_a100s():
     envs = {item["Name"]: item["Value"] for item in config["Envs"]}
     assert envs["EXPERIMENT_NAME"] == "gspo_moe_offpolicy_n2_16gpu_200"
     assert envs["RUN_ID"] == "gspo_moe_offpolicy_n2_16gpu_200"
+
+
+def test_reduced_formal_recipe_only_reduces_token_and_memory_scale():
+    script = REDUCED_FORMAL_SCRIPT.read_text()
+    config = yaml.safe_load(REDUCED_FORMAL_CONFIG.read_text())
+
+    for fragment in [
+        'MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-8192}"',
+        "data.train_batch_size=64",
+        "actor_rollout_ref.actor.ppo_mini_batch_size=16",
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=6144",
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.50",
+        "actor_rollout_ref.rollout.max_num_seqs=128",
+        "actor_rollout_ref.rollout.max_num_batched_tokens=8192",
+        "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=10240",
+        "actor_rollout_ref.rollout.n=8",
+        "trainer.rollout_buffer.delay_steps=2",
+        'assert int(os.environ["MLP_WORKER_NUM"]) >= 1',
+        'assert int(os.environ["MLP_WORKER_GPU"]) >= 1',
+    ]:
+        assert fragment in script
+
+    assert config["TaskRoleSpecs"] == [
+        {"RoleName": "worker", "RoleReplicas": 4, "Flavor": "ml.pni2.14xlarge"}
+    ]
+    assert config["TaskName"] == "gspo-moe-offpolicy-n2-16gpu-b64n8-r8192"
 
 
 def test_formal_recipe_only_changes_documented_scale_settings_from_smoke():

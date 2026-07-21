@@ -121,6 +121,28 @@ test frequency = 5
 save frequency = 5
 ```
 
+## Reduced-Scale 16-GPU Recipe
+
+`run_gspo_qwen3_30b_a3b_offpolicy_16gpu_b64n8_r8192.sh` 是独立的缩减版本，原始论文对齐
+recipe 不会被修改。`b64` 表示 prompt batch size，`n8` 表示每题 rollout 数，`r8192` 表示
+最大回答长度。它仍使用 GSPO、fixed-delay 2、三个验证集和 `avg@8`，仅将训练/工程规模改为：
+
+```text
+train batch size = 64 prompts
+ppo mini-batch size = 16
+max response length = 8192
+actor max tokens per GPU = 6144
+rollout max sequences = 128
+rollout max batched tokens = 8192
+rollout GPU memory utilization = 0.50
+rollout log-prob max tokens per GPU = 10240
+```
+
+16 卡基线实测每个训练 step 约处理 `4.5M` token、耗时约 85--100 分钟，其中 actor 更新
+占约 90%。快速 recipe 预计将 token 量降至约 `0.55M/step`，对应 16 卡约 12--18 分钟的
+非验证 step；每 5 步的三验证集 `avg@8` 评估另计。较低的 actor/vLLM token 上限也为单机
+8 张 A100 80G 的 FSDP=8 部署留出显存余量。
+
 ## 输出与恢复
 
 默认输出：
