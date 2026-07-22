@@ -36,7 +36,7 @@ export MAX_MODEL_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-200}"
 
 export PROJECT_NAME="${PROJECT_NAME:-verl_moe}"
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-gspo_moe_offpolicy_n2_16gpu_b64n8_r8192}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-gspo_moe_pr2_off2_16gpu_b64n8_r8192}"
 export OUTPUT_ROOT="${OUTPUT_ROOT:-.}"
 export CKPT_ROOT="${CKPT_ROOT:-${OUTPUT_ROOT}/checkpoints}"
 export CKPT_DIR=${CKPT_ROOT}/${PROJECT_NAME}/${EXPERIMENT_NAME}
@@ -253,7 +253,7 @@ PY
     actor_rollout_ref.actor.clip_ratio_high=0.002 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
@@ -292,9 +292,7 @@ PY
     +reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
     +reward.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward.reward_kwargs.max_resp_len="${MAX_RESPONSE_LENGTH}" \
-    trainer.rollout_buffer.enable=True \
-    trainer.rollout_buffer.delay_steps=2 \
-    trainer.rollout_buffer.use_rollout_log_probs=True \
+    trainer.rollout_buffer.enable=False \
     trainer.logger="${TRAINER_LOGGER}" \
     trainer.project_name="${PROJECT_NAME}" \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
