@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-# Run the aligned Qwen3-4B GSPO baseline on an already-running Ray cluster.
+# Run the aligned Qwen3-4B GSPO training recipe on an already-running Ray cluster.
 # This recipe consumes one colocated 8-GPU node and never starts or stops Ray.
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
