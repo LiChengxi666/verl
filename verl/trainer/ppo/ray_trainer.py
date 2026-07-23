@@ -1891,8 +1891,10 @@ class RayPPOTrainer:
                 logger.log(data=metrics, step=self.global_steps)
 
                 if save_checkpoint_this_step:
+                    self.checkpoint_manager.sleep_replicas()
                     with marked_timer("save_checkpoint", timing_raw, color="green"):
                         self._save_checkpoint()
+                    self.checkpoint_manager.update_weights(self.global_steps)
 
                 progress_bar.update(1)
                 self.global_steps += 1
