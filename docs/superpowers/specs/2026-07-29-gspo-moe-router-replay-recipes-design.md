@@ -45,8 +45,13 @@ All three recipes use:
 - Processed MATH-17k with 0/1 correctness reward.
 - AMC23, AIME24, and AIME25 validation sets with `avg@8`.
 - One behavior batch of 64 prompts and 8 responses per prompt.
-- A 32-prompt PPO mini-batch and one PPO epoch, giving off-2 sequential
-  optimizer updates without a cross-step rollout buffer.
+- One PPO epoch and no cross-step rollout buffer.
+- `OFF_POLICY_K` defaults to 2 and supports 2, 4, or 8. With a 64-prompt
+  rollout batch, the launcher derives update batch sizes of 32, 16, or 8
+  prompts, respectively.
+- The default actor learning rate follows the Qwen3-30B-A3B PR2 schedule:
+  `2e-6`, `1.5e-6`, or `1e-6` for off-2, off-4, or off-8. An explicit
+  `ACTOR_LR` may override the derived value and is printed during preflight.
 - GSPO clip low/high of `3e-4/4e-4`.
 - Learning rate `2e-6`.
 - Reference-policy KL loss coefficient `1e-3`.
@@ -84,6 +89,11 @@ Environment variables may override model, data, output, W&B secret, resource,
 and parallelism settings. The scripts contain no queue IDs, image registry
 URLs, mounted internal paths, or embedded credentials.
 
+The launcher rejects unsupported off-policy values and requires
+`TRAIN_BATCH_SIZE` to be divisible by `OFF_POLICY_K`. Experiment names,
+checkpoint paths, logs, and W&B run IDs include the effective off-policy
+strength so off-2, off-4, and off-8 runs cannot overwrite one another.
+
 ## Extension Points
 
 `POLICY_LOSS_MODE` and `ROUTER_REPLAY_MODE` are independent validated
@@ -99,6 +109,8 @@ Static recipe tests must verify:
 - all three entry scripts delegate to the same launcher;
 - the wrappers differ only in policy and routing mode declarations;
 - shared scientific parameters match the invariants above;
+- off-2, off-4, and off-8 derive the expected mini-batch size and default
+  learning rate;
 - R2 cannot enable rollout routing replay;
 - R3 must enable rollout routing replay;
 - defaults contain no internal absolute paths;
