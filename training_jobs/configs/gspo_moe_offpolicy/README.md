@@ -3,6 +3,8 @@
 本 recipe 使用 `Qwen3-30B-A3B-Base` 运行 GSPO，并采用 PR2 off-2 更新语义：每次由
 behavior policy 为 64 个 prompt 各生成 8 条 rollout，再将同一批数据按 32 个 prompt
 拆成两个 mini-batch，顺序执行两次 optimizer update。它不使用跨 step rollout buffer。
+这里复用的是 PR2 论文定义的 off-2 数据复用协议，不包含 PR2 的 predictive router、
+route cache/replay 或 predictor KL loss。
 
 ## 代码
 
@@ -83,7 +85,9 @@ sequential optimizer updates per rollout batch = 2
 max prompt length = 2048
 max response length = 8192
 loss mode = gspo
-learning rate = 1e-6
+GSPO clip low / high = 3e-4 / 4e-4
+learning rate = 2e-6
+reference-policy KL loss coefficient = 1e-3
 validation n = 8
 total training steps = 200
 test frequency = 5
