@@ -28,6 +28,7 @@ from torch.distributed.fsdp import ShardedOptimStateDictConfig, ShardedStateDict
 from transformers import GenerationConfig, PreTrainedTokenizer, ProcessorMixin
 from transformers.dynamic_module_utils import custom_object_save
 
+from verl.utils import hdfs_io
 from verl.utils.device import is_cuda_available
 from verl.utils.fs import copy_to_local, is_non_local, local_mkdir_safe
 from verl.utils.fsdp_utils import fsdp_version, get_fsdp_full_state_dict, get_fsdp_state_ctx
@@ -39,6 +40,19 @@ from .checkpoint_manager import BaseCheckpointManager
 # Setup logging
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _resolve_hdfs_checkpoint_path(local_path: str, hdfs_path: str | None) -> str | None:
+    """Recover the remote actor path at the final FSDP checkpoint boundary."""
+    if hdfs_path is not None and is_non_local(hdfs_path):
+        return hdfs_path
+    remote_root = os.environ.get("VERL_HDFS_CKPT_DIR")
+    if not remote_root:
+        return hdfs_path
+    step_name = os.path.basename(os.path.dirname(os.path.normpath(local_path)))
+    if not step_name.startswith("global_step_"):
+        raise ValueError(f"Cannot infer checkpoint step from actor path: {local_path}")
+    return os.path.join(remote_root, step_name, "actor")
 
 
 @dataclass
@@ -114,6 +128,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         """
         if local_path is None:
             return
+        hdfs_path = _resolve_hdfs_checkpoint_path(local_path, hdfs_path)
+        checkpoint_path = hdfs_path or local_path
 
         # check if the checkpoint_load_contents is valid
         if self.should_load_model:
@@ -136,14 +152,18 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         )
         with get_fsdp_state_ctx(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
             if self.should_load_model:
-                remote_model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
+                remote_model_path = os.path.join(
+                    checkpoint_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt"
+                )
                 local_model_path = copy_to_local(remote_model_path)
                 model_state_dict = torch.load(local_model_path, weights_only=False)
                 self.model.load_state_dict(model_state_dict)
                 log_with_rank(f"Loaded model from {remote_model_path}", rank=self.rank, logger=logger)
 
             if self.should_load_optimizer:
-                remote_optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
+                remote_optim_path = os.path.join(
+                    checkpoint_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt"
+                )
                 local_optim_path = copy_to_local(remote_optim_path)
                 optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
                 self.optimizer.load_state_dict(optimizer_state_dict)
@@ -151,7 +171,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
         if self.should_load_extra:
             remote_extra_state_path = os.path.join(
-                local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt"
+                checkpoint_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt"
             )
             local_extra_state_path = copy_to_local(remote_extra_state_path)
             extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
@@ -201,6 +221,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         """
         if local_path is None:
             return
+
+        hdfs_path = _resolve_hdfs_checkpoint_path(local_path, hdfs_path)
 
         # record the previous global step
         self.previous_global_step = global_step
@@ -300,6 +322,21 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
         # wait for everyone to dump to local
         torch.distributed.barrier()
+
+        if hdfs_path is not None:
+            hdfs_io.makedirs(hdfs_path, exist_ok=True)
+            upload_paths = []
+            if self.should_save_model:
+                upload_paths.append(model_path)
+            if self.should_save_optimizer:
+                upload_paths.append(optim_path)
+            if self.should_save_extra:
+                upload_paths.append(extra_path)
+            for upload_path in upload_paths:
+                remote_path = os.path.join(hdfs_path, os.path.basename(upload_path))
+                if not hdfs_io.copy(src=upload_path, dst=remote_path):
+                    raise RuntimeError(f"Failed to upload FSDP checkpoint shard: {upload_path} -> {remote_path}")
+            torch.distributed.barrier()
 
         if self.should_save_hf_model:
             # Only rank 0 will save hf model and,

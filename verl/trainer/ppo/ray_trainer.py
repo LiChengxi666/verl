@@ -23,8 +23,8 @@ import os
 import shutil
 import uuid
 from collections import defaultdict
-from pprint import pprint
 from pathlib import Path
+from pprint import pprint
 from typing import Any, Optional
 
 import numpy as np
@@ -49,8 +49,8 @@ from verl.trainer.ppo.metric_utils import (
     compute_variance_proxy_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.rollout_buffer import FixedDelayRolloutBuffer, RolloutBufferCheckpointError
 from verl.trainer.ppo.reward import extract_reward
+from verl.trainer.ppo.rollout_buffer import FixedDelayRolloutBuffer, RolloutBufferCheckpointError
 from verl.trainer.ppo.utils import (
     Role,
     WorkerType,
@@ -837,6 +837,11 @@ class RayPPOTrainer:
                     OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
                 )
         wg_kwargs["device_name"] = self.device_name
+        hdfs_checkpoint_dir = OmegaConf.select(self.config.trainer, "default_hdfs_dir")
+        if hdfs_checkpoint_dir:
+            # Ray actors do not reliably inherit environment mutations made inside
+            # TaskRunner. Pass the HDFS checkpoint root explicitly to every worker.
+            wg_kwargs["worker_env"] = {"VERL_HDFS_CKPT_DIR": str(hdfs_checkpoint_dir)}
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
             if not class_dict:
@@ -989,8 +994,19 @@ class RayPPOTrainer:
         )
 
         self.actor_rollout_wg.save_checkpoint(
-            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+            actor_local_path,
+            actor_remote_path,
+            self.global_steps,
+            max_actor_ckpt_to_keep,
         )
+        if actor_remote_path is not None:
+            from verl.utils.checkpoint.hdfs_checkpoint import verify_remote_actor_checkpoint
+
+            verify_remote_actor_checkpoint(
+                actor_remote_path,
+                world_size=self.config.trainer.nnodes * self.config.trainer.n_gpus_per_node,
+                strategy=str(self.config.actor_rollout_ref.actor.strategy),
+            )
 
         if self.use_critic:
             critic_local_path = os.path.join(local_global_step_folder, str(Role.Critic))
@@ -1037,6 +1053,14 @@ class RayPPOTrainer:
         self._snapshot_metrics_file(local_global_step_folder)
         self._write_checkpoint_success_marker(local_global_step_folder)
         self._write_latest_checkpoint_pointer()
+        if getattr(self.config.trainer, "default_hdfs_dir", None) is not None:
+            from verl.utils.checkpoint.hdfs_checkpoint import publish_remote_metadata
+
+            publish_remote_metadata(
+                self.config.trainer.default_hdfs_dir,
+                local_global_step_folder,
+                Path(self.config.trainer.default_local_dir) / "latest_checkpointed_iteration.txt",
+            )
         prune_complete_checkpoints(
             self.config.trainer.default_local_dir,
             getattr(self.config.trainer, "max_complete_ckpt_to_keep", None),
@@ -1109,9 +1133,20 @@ class RayPPOTrainer:
         if self.config.trainer.resume_mode == "disable":
             return 0
 
+        remote_global_step_folder = None
         # load from hdfs
         if self.config.trainer.default_hdfs_dir is not None:
-            raise NotImplementedError("load from hdfs is not implemented yet")
+            from verl.utils import hdfs_io
+            from verl.utils.checkpoint.hdfs_checkpoint import download_remote_metadata
+
+            remote_tracker = os.path.join(self.config.trainer.default_hdfs_dir, "latest_checkpointed_iteration.txt")
+            if hdfs_io.exists(remote_tracker):
+                global_step_folder, remote_global_step_folder = download_remote_metadata(
+                    self.config.trainer.default_hdfs_dir,
+                    self.config.trainer.default_local_dir,
+                )
+            else:
+                global_step_folder = None
         else:
             checkpoint_folder = self.config.trainer.default_local_dir  # TODO: check path
             if not os.path.isabs(checkpoint_folder):
@@ -1148,7 +1183,9 @@ class RayPPOTrainer:
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
         # load actor
         self.actor_rollout_wg.load_checkpoint(
-            actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+            actor_path,
+            (os.path.join(remote_global_step_folder, "actor") if remote_global_step_folder is not None else None),
+            self.config.trainer.del_local_ckpt_after_load,
         )
         # load critic
         if self.use_critic:

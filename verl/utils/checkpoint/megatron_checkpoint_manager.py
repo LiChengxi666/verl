@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import random
+import socket
 from collections.abc import Callable
 from dataclasses import asdict
 
@@ -508,6 +509,25 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         tensor_parallel.get_cuda_rng_tracker().set_states(rng_states["rng_tracker_states"])
 
     def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load=False):
+        if hdfs_path is not None:
+            from verl.utils.checkpoint.hdfs_checkpoint import restore_remote_megatron_checkpoint
+
+            world_size = torch.distributed.get_world_size()
+            hostnames = [None] * world_size
+            torch.distributed.all_gather_object(hostnames, socket.gethostname())
+            restored = restore_remote_megatron_checkpoint(
+                hdfs_path,
+                local_path,
+                rank=self.rank,
+                hostnames=hostnames,
+            )
+            if restored:
+                log_with_rank(
+                    f"Restored merged Megatron checkpoint from {hdfs_path} to {local_path}",
+                    rank=self.rank,
+                    logger=logger,
+                )
+            torch.distributed.barrier()
         if local_path is not None:
             assert os.path.exists(local_path), f"Checkpoint path {local_path} does not exist."
 
@@ -636,6 +656,8 @@ class MegatronCheckpointManager(BaseCheckpointManager):
         local_path = local_mkdir_safe(local_path)
         dist_checkpoint_path = get_dist_checkpoint_path(local_path)
         hf_config_tokenizer_path = get_hf_model_checkpoint_path(local_path)
+        if hdfs_path is not None and self.checkpoint_config.async_save:
+            raise RuntimeError("Megatron multi-node HDFS checkpointing requires async_save=False")
 
         # Note that model weights, optimizer states, and extra states are generated
         # together in a state dict, we save them in one time
@@ -856,18 +878,49 @@ class MegatronCheckpointManager(BaseCheckpointManager):
                         )
 
         def finalize_save_fn():
-            # Rank 0 uploads checkpoint to HDFS if hdfs_path is provided
             log_with_rank(
                 f"Dist checkpointing save completed for {dist_checkpoint_path}", rank=self.rank, logger=logger
             )
-            if self.rank == 0:
-                if hdfs_path is not None:
-                    log_with_rank(f"Uploading checkpoint to {hdfs_path}", rank=self.rank, logger=logger)
-                    from verl.utils import hdfs_io
+            if hdfs_path is not None:
+                from verl.utils import hdfs_io
+                from verl.utils.checkpoint.hdfs_checkpoint import (
+                    build_megatron_manifest,
+                    publish_megatron_manifest,
+                    upload_megatron_node_checkpoint,
+                )
 
+                world_size = torch.distributed.get_world_size()
+                hostnames = [None] * world_size
+                torch.distributed.all_gather_object(hostnames, socket.gethostname())
+                local_files = sorted(
+                    os.path.relpath(os.path.join(root, name), dist_checkpoint_path)
+                    for root, _, names in os.walk(dist_checkpoint_path)
+                    for name in names
+                )
+                files_by_rank = [None] * world_size
+                torch.distributed.all_gather_object(files_by_rank, local_files)
+                manifest = build_megatron_manifest(hostnames, files_by_rank)
+                uploaded = upload_megatron_node_checkpoint(
+                    dist_checkpoint_path,
+                    hdfs_path,
+                    rank=self.rank,
+                    manifest=manifest,
+                )
+                if uploaded:
+                    log_with_rank(
+                        f"Uploaded local-node Megatron shards to {hdfs_path}",
+                        rank=self.rank,
+                        logger=logger,
+                    )
+                torch.distributed.barrier()
+                if self.rank == 0:
                     hdfs_io.makedirs(hdfs_path, exist_ok=True)
-                    hdfs_io.copy(src=dist_checkpoint_path, dst=hdfs_path, dirs_exist_ok=True)
                     hdfs_io.copy(src=hf_config_tokenizer_path, dst=hdfs_path, dirs_exist_ok=True)
+                    transformer_config_path = get_transformer_config_checkpoint_path(local_path)
+                    if os.path.isfile(transformer_config_path):
+                        hdfs_io.copy(src=transformer_config_path, dst=hdfs_path, dirs_exist_ok=True)
+                    publish_megatron_manifest(local_path, hdfs_path, manifest)
+                torch.distributed.barrier()
 
             # update latest_checkpointed_iteration.txt when async_save is True
             if self.checkpoint_config.async_save and self.rank == 0:

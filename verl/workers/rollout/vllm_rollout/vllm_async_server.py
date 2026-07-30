@@ -374,6 +374,10 @@ class vLLMHttpServer:
             cmds[server_args.subparser].validate(server_args)
 
         # 3. launch server
+        # Multiple colocated vLLM servers otherwise share the same Torch compile
+        # cache and can concurrently corrupt its binary cache entries.
+        os.environ["VLLM_CACHE_ROOT"] = f"/tmp/verl-vllm-cache/replica-{self.replica_rank}-node-{self.node_rank}"
+        os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
         if self.node_rank == 0:
             await self.run_server(server_args)
         else:

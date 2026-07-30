@@ -121,12 +121,24 @@ class TaskRunner:
 
     def add_actor_rollout_worker(self, config):
         """Add actor rollout worker using the unified model engine implementation."""
+        from omegaconf import OmegaConf
+
         from verl.single_controller.ray import RayWorkerGroup
         from verl.trainer.ppo.ray_trainer import Role
         from verl.workers.engine_workers import ActorRolloutRefWorker
 
         actor_rollout_cls = ActorRolloutRefWorker
         ray_worker_group_cls = RayWorkerGroup
+        hdfs_checkpoint_dir = config.trainer.get("default_hdfs_dir")
+        if hdfs_checkpoint_dir:
+            # Keep the remote root in serialized worker config because optional
+            # path arguments and actor env do not reliably cross nested dispatch.
+            OmegaConf.update(
+                config.actor_rollout_ref,
+                "_checkpoint_hdfs_dir",
+                str(hdfs_checkpoint_dir),
+                force_add=True,
+            )
 
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:

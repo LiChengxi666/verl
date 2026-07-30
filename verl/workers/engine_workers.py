@@ -36,6 +36,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_device_name, get_torch_device, is_npu_available, set_expandable_segments
 from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
 from verl.utils.flops_counter import FlopsCounter
+from verl.utils.fs import is_non_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.metric.utils import Metric
@@ -56,6 +57,23 @@ from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _resolve_hdfs_actor_path(
+    local_path: str,
+    hdfs_path: Optional[str],
+    remote_root: Optional[str] = None,
+) -> Optional[str]:
+    """Recover the actor HDFS path when nested Ray dispatch drops the optional argument."""
+    if hdfs_path is not None and is_non_local(hdfs_path):
+        return hdfs_path
+    remote_root = remote_root or os.environ.get("VERL_HDFS_CKPT_DIR")
+    if not remote_root:
+        return None
+    step_name = os.path.basename(os.path.dirname(os.path.normpath(local_path)))
+    if not step_name.startswith("global_step_"):
+        raise ValueError(f"Cannot infer checkpoint step from actor path: {local_path}")
+    return os.path.join(remote_root, step_name, "actor")
 
 
 def _with_routing_replay_flag(enabled: bool):
@@ -429,10 +447,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+        hdfs_path = _resolve_hdfs_actor_path(local_path, hdfs_path)
         return self.engine.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+        hdfs_path = _resolve_hdfs_actor_path(local_path, hdfs_path)
         return self.engine.load_checkpoint(local_path, hdfs_path, del_local_after_load)
 
 
@@ -653,11 +673,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
         assert "actor" in self.role, "load_checkpoint only support actor role"
+        hdfs_path = _resolve_hdfs_actor_path(
+            local_path,
+            hdfs_path,
+            self.config.get("_checkpoint_hdfs_dir"),
+        )
         self.actor.load_checkpoint(local_path, hdfs_path, del_local_after_load)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         assert "actor" in self.role, "save_checkpoint only support actor role"
+        hdfs_path = _resolve_hdfs_actor_path(
+            local_path,
+            hdfs_path,
+            self.config.get("_checkpoint_hdfs_dir"),
+        )
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)

@@ -36,6 +36,37 @@ __all__ = ["Worker"]
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+_INHERITED_WORKER_ENV_NAMES = (
+    "VERL_HDFS_CKPT_DIR",
+    "VERL_HDFS_UPLOAD_CONCURRENCY",
+    "HADOOP_CONF_DIR",
+    "INFSEC_HADOOP_ENABLED",
+    "MLX_USER",
+    "MLX_USER_TOKEN",
+    "SEC_IDENTITY_DIR",
+    "SEC_TOKEN_PATH",
+    "ZTI_TOKEN",
+    "CPP_HDFS_CONF",
+    "HADOOP_CLIENT_OPTS",
+    "KRB5_CONFIG",
+    "PATH",
+)
+
+
+def _inherited_worker_env() -> dict[str, str]:
+    """Forward checkpoint transport settings to explicitly configured Ray workers."""
+    return {name: os.environ[name] for name in _INHERITED_WORKER_ENV_NAMES if name in os.environ}
+
+
+def _merge_worker_env(system_env: dict[str, str], worker_env: dict[str, str] | None) -> dict[str, str]:
+    """Merge worker env while allowing an explicit, identical value."""
+    if not worker_env:
+        return system_env
+    conflicts = {name for name in set(system_env) & set(worker_env) if system_env[name] != worker_env[name]}
+    if conflicts:
+        raise ValueError(f"Cannot override protected system env: {conflicts}")
+    return {**system_env, **worker_env}
+
 
 def get_random_string(length: int) -> str:
     import random
@@ -636,16 +667,20 @@ class RayWorkerGroup(WorkerGroup):
             "MASTER_ADDR": self._master_addr,
             "MASTER_PORT": self._master_port,
         }
+        env_vars.update(_inherited_worker_env())
         if worker_env is not None:
             logging.debug(f"Appending ray class env, origin: {env_vars}, customized env: {worker_env}")
-            conflict_env_vars = set(env_vars.keys()) & set(worker_env.keys())
-            if len(conflict_env_vars) > 0:
+            try:
+                env_vars = _merge_worker_env(env_vars, worker_env)
+            except ValueError:
+                conflict_env_vars = {
+                    name for name in set(env_vars) & set(worker_env) if env_vars[name] != worker_env[name]
+                }
                 logging.error(
                     f"User customized env vars conflict with system env: {conflict_env_vars} "
                     f"Overriding may cause unexpected behavior."
                 )
-                raise ValueError(f"Cannot override protected system env: {conflict_env_vars}")
-            env_vars.update(worker_env)
+                raise
         import re
 
         cia_name = type(ray_cls_with_init.cls).__name__
