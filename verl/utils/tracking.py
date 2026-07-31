@@ -77,7 +77,24 @@ class Tracking:
             if config and config["trainer"].get("wandb_proxy", None):
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
             entity = os.environ.get("WANDB_ENTITY", None)
-            wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
+            init_kwargs = {}
+            resume_from = os.environ.get("VERL_WANDB_RESUME_FROM")
+            if resume_from:
+                import inspect
+
+                if "resume_from" not in inspect.signature(wandb.init).parameters:
+                    raise RuntimeError(
+                        "VERL_WANDB_RESUME_FROM requires a W&B SDK with resume_from support"
+                    )
+                init_kwargs["resume_from"] = resume_from
+            wandb.init(
+                project=project_name,
+                name=experiment_name,
+                entity=entity,
+                config=config,
+                settings=settings,
+                **init_kwargs,
+            )
             self.logger["wandb"] = wandb
 
         if "trackio" in default_backend:
