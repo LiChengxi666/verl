@@ -136,3 +136,5 @@ validation_generations/
 training_jobs/
 
 models/
+!verl/models/
+!verl/models/**
