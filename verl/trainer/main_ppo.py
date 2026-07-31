@@ -17,6 +17,7 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 import os
 import socket
+from copy import deepcopy
 
 import hydra
 import ray
@@ -29,6 +30,26 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
+
+RAY_ENV_PASSTHROUGH = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "PYTHONPATH",
+    "TENSORBOARD_LOG_PATH",
+    "VERL_FILE_LOGGER_PATH",
+    "VERL_WANDB_RESUME_FROM",
+    "WANDB_API_KEY",
+    "WANDB_BASE_URL",
+    "WANDB_DIR",
+    "WANDB_ENTITY",
+    "WANDB_MODE",
+    "WANDB_NAME",
+    "WANDB_RUN_ID",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+)
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -72,8 +93,18 @@ def run_ppo(config, task_runner_class=None) -> None:
 
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
-        print(f"ray init kwargs: {ray_init_kwargs}")
-        ray.init(**OmegaConf.to_container(ray_init_kwargs))
+        ray_init_kwargs = OmegaConf.to_container(ray_init_kwargs)
+        runtime_env_vars = ray_init_kwargs["runtime_env"].setdefault("env_vars", {})
+        for key in RAY_ENV_PASSTHROUGH:
+            if key in os.environ:
+                runtime_env_vars[key] = os.environ[key]
+
+        printable_ray_init_kwargs = deepcopy(ray_init_kwargs)
+        printable_env_vars = printable_ray_init_kwargs["runtime_env"].get("env_vars", {})
+        if "WANDB_API_KEY" in printable_env_vars:
+            printable_env_vars["WANDB_API_KEY"] = "<redacted>"
+        print(f"ray init kwargs: {printable_ray_init_kwargs}")
+        ray.init(**ray_init_kwargs)
 
     if task_runner_class is None:
         task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
