@@ -32,6 +32,7 @@ from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
 
 RAY_ENV_PASSTHROUGH = (
+    "HADOOP_CONF_DIR",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "NO_PROXY",
