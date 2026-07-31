@@ -45,6 +45,7 @@ RAY_ENV_PASSTHROUGH = (
     "WANDB_ENTITY",
     "WANDB_MODE",
     "WANDB_NAME",
+    "WANDB_RESUME",
     "WANDB_RUN_ID",
     "http_proxy",
     "https_proxy",
