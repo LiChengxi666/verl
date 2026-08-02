@@ -2287,8 +2287,7 @@ def compute_policy_loss_prefix_ripo_clip(
     return pg_loss, pg_metrics
 
 
-@register_policy_loss("prefix_exact_kl_clip")
-def compute_policy_loss_prefix_exact_kl_clip(
+def _compute_policy_loss_prefix_exact_kl_clip(
     old_log_prob: torch.Tensor,
     log_prob: torch.Tensor,
     advantages: torch.Tensor,
@@ -2296,12 +2295,19 @@ def compute_policy_loss_prefix_exact_kl_clip(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    *,
+    probability_weighted: bool,
+    loss_name: str,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Average-prefix surrogate with exact probability-weighted KL clipping.
+    """Average-prefix surrogate with exact prefix KL-coordinate clipping.
 
-    For each sampled prefix, this loss applies the coordinate constraint
+    The unweighted strategy applies
 
-        R - 1 - log(R) <= t * delta / pi_old(prefix),
+        R - 1 - log(R) <= t * delta.
+
+    The probability-weighted strategy instead applies
+
+        R - 1 - log(R) <= t * delta / pi_old(prefix).
 
     where ``R = exp(sum_{k<=t} log r_k)`` is the raw prefix likelihood
     ratio. Separate low/high deltas define the two roots. The resulting raw
@@ -2329,11 +2335,15 @@ def compute_policy_loss_prefix_exact_kl_clip(
     prefix_avg_log_ratio = prefix_log_ratio_sum / prefix_len
     old_prefix_log_prob = torch.cumsum(old_log_prob * response_mask, dim=-1)
 
-    # log(t * delta / pi_old(prefix)) is stable even when the old-policy
-    # prefix probability itself underflows to zero.
+    # Work with the logarithm of the right-hand side. For the weighted
+    # coordinate constraint this also avoids materializing pi_old(prefix),
+    # which underflows rapidly for long responses.
     log_prefix_len = torch.log(prefix_len)
-    log_budget_low = log_prefix_len + np.log(delta_low) - old_prefix_log_prob
-    log_budget_high = log_prefix_len + np.log(delta_high) - old_prefix_log_prob
+    log_budget_low = log_prefix_len + np.log(delta_low)
+    log_budget_high = log_prefix_len + np.log(delta_high)
+    if probability_weighted:
+        log_budget_low = log_budget_low - old_prefix_log_prob
+        log_budget_high = log_budget_high - old_prefix_log_prob
     lower_log_bound, _ = _solve_exact_prefix_kl_log_bounds(log_budget_low)
     _, upper_log_bound = _solve_exact_prefix_kl_log_bounds(log_budget_high)
 
@@ -2379,7 +2389,7 @@ def compute_policy_loss_prefix_exact_kl_clip(
     eps_neg = torch.where(finite_lower, -lower_avg_log_bound.detach(), torch.zeros_like(lower_avg_log_bound))
 
     _dump_prefix_clip_response_diagnostics(
-        loss_name="prefix_exact_kl_clip",
+        loss_name=loss_name,
         response_mask=response_mask,
         clipped=clipped,
         lower_clipped=lower_clipped,
@@ -2397,13 +2407,14 @@ def compute_policy_loss_prefix_exact_kl_clip(
         * response_mask_float
     ).sum() / finite_lower_count
 
-    metric_prefix = "actor/prefix_exact_kl_clip"
+    metric_prefix = f"actor/{loss_name}"
     pg_metrics = {
         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
         f"{metric_prefix}/delta_low": delta_low,
         f"{metric_prefix}/delta_high": delta_high,
+        f"{metric_prefix}/probability_weighted": float(probability_weighted),
         f"{metric_prefix}/avg_log_ratio_abs_mean": verl_F.masked_mean(
             prefix_avg_log_ratio.detach().abs(), response_mask
         ).item(),
@@ -2428,8 +2439,7 @@ def compute_policy_loss_prefix_exact_kl_clip(
         f"{metric_prefix}/finite_lower_avg_log_bound_mean": finite_lower_mean.detach().item(),
     }
 
-    # Position metrics expose whether the probability-weighted exact bound
-    # becomes inactive as the sampled prefix probability decays.
+    # Position metrics expose how the exact bound evolves along the response.
     seq_len = response_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
     relative_pos = (prefix_len / seq_len).clamp(min=0.0, max=1.0)
     valid_response_mask = response_mask.bool()
@@ -2456,6 +2466,56 @@ def compute_policy_loss_prefix_exact_kl_clip(
         ).detach().item()
 
     return pg_loss, pg_metrics
+
+
+@register_policy_loss("prefix_exact_kl_clip")
+def compute_policy_loss_prefix_exact_kl_clip(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Exact prefix KL-coordinate clip weighted by old prefix probability."""
+
+    return _compute_policy_loss_prefix_exact_kl_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_is_weights=rollout_is_weights,
+        probability_weighted=True,
+        loss_name="prefix_exact_kl_clip",
+    )
+
+
+@register_policy_loss("prefix_exact_kl_unweighted_clip")
+def compute_policy_loss_prefix_exact_kl_unweighted_clip(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Exact prefix KL-coordinate clip with ``R - 1 - log(R) <= t * delta``."""
+
+    return _compute_policy_loss_prefix_exact_kl_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_is_weights=rollout_is_weights,
+        probability_weighted=False,
+        loss_name="prefix_exact_kl_unweighted_clip",
+    )
 
 
 @register_policy_loss("prefix_sqrt_dynamic_clip")
