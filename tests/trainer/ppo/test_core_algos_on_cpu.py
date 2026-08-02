@@ -24,16 +24,59 @@ from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
+    compute_policy_loss_prefix_ripo_clip,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
     get_adv_estimator_fn,
     kl_penalty,
     register_adv_est,
 )
+from verl.workers.config.actor import ActorConfig, PolicyLossConfig
 
 
 def mock_test_fn():
     pass
+
+
+def test_prefix_ripo_clip_matches_average_token_kl_bound():
+    """RIPO clipping must use the uncapped cumulative prefix log-ratio."""
+    seq_len = 100
+    delta = 1e-5
+    old_log_prob = torch.full((1, seq_len), -1.9)
+    log_prob = torch.full((1, seq_len), -0.9, requires_grad=True)
+    advantages = torch.ones((1, seq_len))
+    response_mask = torch.ones((1, seq_len))
+
+    config = ActorConfig(
+        strategy="fsdp",
+        rollout_n=1,
+        ppo_micro_batch_size=1,
+        policy_loss=PolicyLossConfig(prefix_ripo_delta_low=delta, prefix_ripo_delta_high=delta),
+    )
+
+    loss, metrics = compute_policy_loss_prefix_ripo_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        config=config,
+    )
+
+    prefix_len = torch.arange(1, seq_len + 1, dtype=old_log_prob.dtype)
+    old_prefix_log_prob = -1.9 * prefix_len
+    radius_log = 0.5 * (torch.log(2.0 * prefix_len * delta) - old_prefix_log_prob)
+    upper_log_bound = torch.logaddexp(torch.zeros_like(radius_log), radius_log)
+    prefix_log_ratio = prefix_len
+    expected_upper_clipped = prefix_log_ratio > upper_log_bound
+
+    assert expected_upper_clipped.any()
+    assert prefix_log_ratio[-1] > 80.0
+    assert metrics["actor/pg_clipfrac"] == pytest.approx(expected_upper_clipped.float().mean().item())
+
+    loss.backward()
+    assert torch.isfinite(loss)
+    clipped_grad = log_prob.grad[0, expected_upper_clipped]
+    assert torch.allclose(clipped_grad, torch.zeros_like(clipped_grad))
 
 
 class TestRegisterAdvEst(unittest.TestCase):

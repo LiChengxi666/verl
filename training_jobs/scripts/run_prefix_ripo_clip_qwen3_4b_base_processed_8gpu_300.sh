@@ -56,6 +56,7 @@ export PROJECT_NAME=verl_math_repro
 # such as 0.02/0.05/0.08, which would be too loose under this semantics.
 export RIPO_DELTA_LOW="${RIPO_DELTA_LOW:-1e-5}"
 export RIPO_DELTA_HIGH="${RIPO_DELTA_HIGH:-3e-5}"
+export LOSS_MODE="${LOSS_MODE:-prefix_ripo_clip}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-prefix-ripo-l1em5-h3em5-qwen3-4b-8gpu}"
 
 export CKPT_DIR="${CKPT_DIR:-${REPO_DIR}/checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}"
@@ -148,7 +149,7 @@ PY
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.policy_loss.loss_mode=prefix_ripo_clip \
+    actor_rollout_ref.actor.policy_loss.loss_mode="${LOSS_MODE}" \
     actor_rollout_ref.actor.policy_loss.prefix_clip_first_low=0.2 \
     actor_rollout_ref.actor.policy_loss.prefix_clip_first_high=0.28 \
     actor_rollout_ref.actor.policy_loss.prefix_clip_final_low=3e-4 \
@@ -193,8 +194,8 @@ PY
     trainer.nnodes="${MLP_WORKER_NUM}" \
     trainer.n_gpus_per_node="${MLP_WORKER_GPU}" \
     trainer.val_before_train=True \
-    trainer.test_freq=10 \
-    trainer.save_freq=10 \
+    trainer.test_freq=5 \
+    trainer.save_freq=5 \
     trainer.resume_mode=auto \
     trainer.default_local_dir="${CKPT_DIR}" \
     trainer.max_actor_ckpt_to_keep=5 \
