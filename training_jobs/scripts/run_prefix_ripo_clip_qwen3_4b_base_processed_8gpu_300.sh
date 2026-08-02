@@ -56,6 +56,8 @@ export PROJECT_NAME=verl_math_repro
 # such as 0.02/0.05/0.08, which would be too loose under this semantics.
 export RIPO_DELTA_LOW="${RIPO_DELTA_LOW:-1e-5}"
 export RIPO_DELTA_HIGH="${RIPO_DELTA_HIGH:-3e-5}"
+export PREFIX_EXACT_KL_DELTA_LOW="${PREFIX_EXACT_KL_DELTA_LOW:-0.02}"
+export PREFIX_EXACT_KL_DELTA_HIGH="${PREFIX_EXACT_KL_DELTA_HIGH:-0.05}"
 export LOSS_MODE="${LOSS_MODE:-prefix_ripo_clip}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-prefix-ripo-l1em5-h3em5-qwen3-4b-8gpu}"
 
@@ -156,6 +158,8 @@ PY
     actor_rollout_ref.actor.policy_loss.prefix_clip_final_high=4e-4 \
     actor_rollout_ref.actor.policy_loss.prefix_ripo_delta_low="${RIPO_DELTA_LOW}" \
     actor_rollout_ref.actor.policy_loss.prefix_ripo_delta_high="${RIPO_DELTA_HIGH}" \
+    actor_rollout_ref.actor.policy_loss.prefix_exact_kl_delta_low="${PREFIX_EXACT_KL_DELTA_LOW}" \
+    actor_rollout_ref.actor.policy_loss.prefix_exact_kl_delta_high="${PREFIX_EXACT_KL_DELTA_HIGH}" \
     actor_rollout_ref.actor.loss_agg_mode=token-mean \
     actor_rollout_ref.actor.clip_ratio_low=0.0003 \
     actor_rollout_ref.actor.clip_ratio_high=0.0004 \

@@ -103,6 +103,8 @@ class PolicyLossConfig(BaseConfig):
     prefix_clip_sum_alpha: float = 2.0
     prefix_ripo_delta_low: float = 1e-5
     prefix_ripo_delta_high: float = 3e-5
+    prefix_exact_kl_delta_low: float = 0.02
+    prefix_exact_kl_delta_high: float = 0.05
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
 
 

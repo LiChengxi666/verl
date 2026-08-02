@@ -3,10 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# Match the final 4B GSPO/prefix recipe and change only the clipping strategy.
+# Exact per-prefix constraint: R - 1 - log(R) <= t * delta.
+# These scalar deltas are exploratory sweep defaults, not CTPO epsilons.
 export LOSS_MODE=prefix_exact_kl_clip
-export RIPO_DELTA_LOW="${RIPO_DELTA_LOW:-1e-5}"
-export RIPO_DELTA_HIGH="${RIPO_DELTA_HIGH:-3e-5}"
-export EXPERIMENT_NAME="${EXPERIMENT_NAME:-prefix-exact-kl-l1em5-h3em5-qwen3-4b-8gpu}"
+export PREFIX_EXACT_KL_DELTA_LOW="${PREFIX_EXACT_KL_DELTA_LOW:-0.02}"
+export PREFIX_EXACT_KL_DELTA_HIGH="${PREFIX_EXACT_KL_DELTA_HIGH:-0.05}"
+export EXPERIMENT_NAME="${EXPERIMENT_NAME:-prefix-exact-kl-l002-h005-qwen3-4b-8gpu}"
 
 exec bash "${SCRIPT_DIR}/run_prefix_ripo_clip_qwen3_4b_base_processed_8gpu_300.sh"

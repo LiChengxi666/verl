@@ -24,6 +24,7 @@ from verl.trainer.ppo.core_algos import (
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
+    compute_policy_loss_prefix_exact_kl_clip,
     compute_policy_loss_prefix_ripo_clip,
     compute_rloo_outcome_advantage,
     compute_rloo_vectorized_outcome_advantage,
@@ -77,6 +78,38 @@ def test_prefix_ripo_clip_matches_average_token_kl_bound():
     assert torch.isfinite(loss)
     clipped_grad = log_prob.grad[0, expected_upper_clipped]
     assert torch.allclose(clipped_grad, torch.zeros_like(clipped_grad))
+
+
+def test_prefix_exact_kl_clip_uses_cumulative_prefix_ratio_with_token_local_gradient():
+    old_log_prob = torch.tensor([[-2.0, -2.0, -2.0]])
+    token_log_ratio = torch.tensor([[0.1, 0.2, -0.1]])
+    log_prob = (old_log_prob + token_log_ratio).requires_grad_(True)
+    response_mask = torch.ones_like(old_log_prob)
+    advantages = -torch.ones_like(old_log_prob)
+
+    config = ActorConfig(
+        strategy="fsdp",
+        rollout_n=1,
+        ppo_micro_batch_size=1,
+        policy_loss=PolicyLossConfig(prefix_exact_kl_delta_low=100.0, prefix_exact_kl_delta_high=100.0),
+    )
+
+    loss, metrics = compute_policy_loss_prefix_exact_kl_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        config=config,
+    )
+
+    cumulative_prefix_ratio = torch.exp(torch.cumsum(token_log_ratio, dim=-1))
+    assert loss.item() == pytest.approx(cumulative_prefix_ratio.mean().item())
+    assert metrics["actor/prefix_exact_kl_clip/probability_weighted"] == 0.0
+
+    loss.backward()
+    # Stop-gradient keeps the cumulative prefix value but routes each loss
+    # term's gradient through its current token only.
+    assert torch.allclose(log_prob.grad, cumulative_prefix_ratio / token_log_ratio.shape[-1], atol=1e-6)
 
 
 class TestRegisterAdvEst(unittest.TestCase):

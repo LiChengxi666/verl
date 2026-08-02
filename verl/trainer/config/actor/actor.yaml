@@ -96,6 +96,12 @@ policy_loss:
   # RIPO-like average-token upper trust-region budget for prefix RIPO clip
   prefix_ripo_delta_high: 3e-5
 
+  # Experimental scalar lower KL-coordinate budget for cumulative prefix-ratio clipping
+  prefix_exact_kl_delta_low: 0.02
+
+  # Experimental scalar upper KL-coordinate budget; this is not CTPO's log-space epsilon
+  prefix_exact_kl_delta_high: 0.05
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

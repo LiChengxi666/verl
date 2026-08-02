@@ -2310,23 +2310,21 @@ def _compute_policy_loss_prefix_exact_kl_clip(
         R - 1 - log(R) <= t * delta / pi_old(prefix).
 
     where ``R = exp(sum_{k<=t} log r_k)`` is the raw prefix likelihood
-    ratio. Separate low/high deltas define the two roots. The resulting raw
-    prefix log-ratio bounds are divided by ``t`` before clipping the
-    average-prefix surrogate, so this strategy changes only the clipping rule
-    relative to ``prefix_dynamic_clip`` and ``prefix_ripo_clip``.
+    ratio. Separate low/high deltas define the two roots. Both the surrogate
+    importance weight and its clip bounds use this cumulative prefix ratio.
 
-    As in the other prefix losses, the prefix ratio is detached and gradients
-    flow only through the current-token log probability.
+    The cumulative prefix ratio is detached and gradients flow only through
+    the current-token log probability.
     """
 
     assert config is not None
     assert isinstance(config, ActorConfig)
 
     policy_loss_cfg = config.policy_loss
-    delta_low = float(policy_loss_cfg.get("prefix_ripo_delta_low", 1e-5))
-    delta_high = float(policy_loss_cfg.get("prefix_ripo_delta_high", 3e-5))
+    delta_low = float(policy_loss_cfg.get("prefix_exact_kl_delta_low", 0.02))
+    delta_high = float(policy_loss_cfg.get("prefix_exact_kl_delta_high", 0.05))
     if delta_low <= 0.0 or delta_high <= 0.0:
-        raise ValueError("prefix_ripo_delta_low/high must both be positive.")
+        raise ValueError("prefix_exact_kl_delta_low/high must both be positive.")
 
     negative_approx_kl = log_prob - old_log_prob
     log_ratio = negative_approx_kl * response_mask
@@ -2350,16 +2348,14 @@ def _compute_policy_loss_prefix_exact_kl_clip(
     prefix_log_ratio_sum_clip = torch.minimum(
         torch.maximum(prefix_log_ratio_sum, lower_log_bound), upper_log_bound
     )
-    lower_avg_log_bound = lower_log_bound / prefix_len
-    upper_avg_log_bound = upper_log_bound / prefix_len
 
-    # The detached prefix term supplies the numerical importance weight. The
-    # zero-valued log_prob - log_prob.detach() term supplies only the current
-    # token gradient, matching the established GSPO-style gradient lock.
-    prefix_log_importance_ratio = log_prob - log_prob.detach() + prefix_avg_log_ratio.detach()
+    # The detached cumulative prefix term supplies the numerical importance
+    # weight R_pre. The zero-valued log_prob - log_prob.detach() term supplies
+    # only the current-token gradient.
+    prefix_log_importance_ratio = log_prob - log_prob.detach() + prefix_log_ratio_sum.detach()
     prefix_log_importance_ratio = torch.clamp(prefix_log_importance_ratio, min=-10.0, max=10.0)
     prefix_log_importance_ratio_clip = torch.minimum(
-        torch.maximum(prefix_log_importance_ratio, lower_avg_log_bound), upper_avg_log_bound
+        torch.maximum(prefix_log_importance_ratio, lower_log_bound), upper_log_bound
     )
     prefix_log_importance_ratio_clip = torch.clamp(prefix_log_importance_ratio_clip, min=-10.0, max=10.0)
 
@@ -2384,7 +2380,9 @@ def _compute_policy_loss_prefix_exact_kl_clip(
     pg_clipfrac = verl_F.masked_mean(clipped.float(), response_mask)
     pg_clipfrac_lower = verl_F.masked_mean(lower_clipped.float(), response_mask)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
-    finite_lower = torch.isfinite(lower_avg_log_bound)
+    lower_avg_log_bound = lower_log_bound / prefix_len
+    upper_avg_log_bound = upper_log_bound / prefix_len
+    finite_lower = torch.isfinite(lower_log_bound)
     eps_pos = upper_avg_log_bound.detach()
     eps_neg = torch.where(finite_lower, -lower_avg_log_bound.detach(), torch.zeros_like(lower_avg_log_bound))
 
@@ -2468,8 +2466,8 @@ def _compute_policy_loss_prefix_exact_kl_clip(
     return pg_loss, pg_metrics
 
 
-@register_policy_loss("prefix_exact_kl_clip")
-def compute_policy_loss_prefix_exact_kl_clip(
+@register_policy_loss("prefix_probability_weighted_exact_kl_clip")
+def compute_policy_loss_prefix_probability_weighted_exact_kl_clip(
     old_log_prob: torch.Tensor,
     log_prob: torch.Tensor,
     advantages: torch.Tensor,
@@ -2489,12 +2487,12 @@ def compute_policy_loss_prefix_exact_kl_clip(
         config=config,
         rollout_is_weights=rollout_is_weights,
         probability_weighted=True,
-        loss_name="prefix_exact_kl_clip",
+        loss_name="prefix_probability_weighted_exact_kl_clip",
     )
 
 
-@register_policy_loss("prefix_exact_kl_unweighted_clip")
-def compute_policy_loss_prefix_exact_kl_unweighted_clip(
+@register_policy_loss("prefix_exact_kl_clip")
+def compute_policy_loss_prefix_exact_kl_clip(
     old_log_prob: torch.Tensor,
     log_prob: torch.Tensor,
     advantages: torch.Tensor,
@@ -2514,7 +2512,7 @@ def compute_policy_loss_prefix_exact_kl_unweighted_clip(
         config=config,
         rollout_is_weights=rollout_is_weights,
         probability_weighted=False,
-        loss_name="prefix_exact_kl_unweighted_clip",
+        loss_name="prefix_exact_kl_clip",
     )
 
 
