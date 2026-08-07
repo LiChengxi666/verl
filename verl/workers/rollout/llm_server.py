@@ -199,6 +199,7 @@ class LLMServerClient:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
         server_id, server = await self._acquire_server(request_id)
+        generation_request_id = uuid4().hex
         try:
             multimodal_kwargs = {}
             if audio_data is not None:
@@ -206,7 +207,7 @@ class LLMServerClient:
             if mm_processor_kwargs:
                 multimodal_kwargs["mm_processor_kwargs"] = mm_processor_kwargs
             output: TokenOutput = await server.generate.remote(
-                request_id=uuid4().hex,  # use new request_id for each turn
+                request_id=generation_request_id,  # use new request_id for each turn
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
@@ -215,6 +216,9 @@ class LLMServerClient:
                 **kwargs,
             )
             return output
+        except asyncio.CancelledError:
+            await server.abort_request.remote(generation_request_id)
+            raise
         finally:
             self._release_server(server_id)
 

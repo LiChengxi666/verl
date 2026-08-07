@@ -178,6 +178,21 @@ class RayResourcePool(ResourcePool):
                 bundle[self.accelerator_type] = 1e-4
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
 
+        # Optionally pin each node-sized placement group to an explicit Ray node.
+        # This is useful for resuming a distributed job on a previously validated
+        # set of hosts while leaving the training configuration unchanged.
+        placement_node_resources = os.getenv("VERL_PLACEMENT_NODE_RESOURCES")
+        if placement_node_resources:
+            node_resources = [item.strip() for item in placement_node_resources.split(",") if item.strip()]
+            if len(node_resources) != len(pg_scheme):
+                raise ValueError(
+                    "VERL_PLACEMENT_NODE_RESOURCES must contain exactly one Ray node resource "
+                    f"per placement group: expected {len(pg_scheme)}, got {len(node_resources)}"
+                )
+            for bundles, node_resource in zip(pg_scheme, node_resources, strict=True):
+                for pg_bundle in bundles:
+                    pg_bundle[node_resource] = 1e-4
+
         lifetime = "detached" if self.detached else None
 
         pgs = [

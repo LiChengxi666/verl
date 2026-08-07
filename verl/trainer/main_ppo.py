@@ -17,7 +17,20 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 import os
 import socket
+import sys
 from copy import deepcopy
+from pathlib import Path
+
+# Ray workers otherwise pick up the platform-patched W&B package from user site.
+_VENDORED_WANDB = Path(__file__).resolve().parents[2] / ".ray_vendor"
+if (_VENDORED_WANDB / "wandb").is_dir():
+    sys.path.insert(0, str(_VENDORED_WANDB))
+    _wandb_core = _VENDORED_WANDB / "wandb" / "bin" / "wandb-core"
+    if _wandb_core.is_file() and not os.access(_wandb_core, os.X_OK):
+        _wandb_core.chmod(0o755)
+    import wandb as _wandb
+
+    print(f"WANDB_SDK_BOOTSTRAP version={_wandb.__version__} path={_wandb.__file__}")
 
 import hydra
 import ray
@@ -100,6 +113,10 @@ def run_ppo(config, task_runner_class=None) -> None:
         for key in RAY_ENV_PASSTHROUGH:
             if key in os.environ:
                 runtime_env_vars[key] = os.environ[key]
+        if (_VENDORED_WANDB / "wandb").is_dir():
+            pythonpath = runtime_env_vars.get("PYTHONPATH", "")
+            vendor_path = ".ray_vendor"
+            runtime_env_vars["PYTHONPATH"] = vendor_path + (f":{pythonpath}" if pythonpath else "")
 
         printable_ray_init_kwargs = deepcopy(ray_init_kwargs)
         printable_env_vars = printable_ray_init_kwargs["runtime_env"].get("env_vars", {})
