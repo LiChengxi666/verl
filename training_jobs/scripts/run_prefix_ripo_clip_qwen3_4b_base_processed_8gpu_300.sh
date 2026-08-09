@@ -56,8 +56,8 @@ export PROJECT_NAME=verl_math_repro
 # such as 0.02/0.05/0.08, which would be too loose under this semantics.
 export RIPO_DELTA_LOW="${RIPO_DELTA_LOW:-1e-5}"
 export RIPO_DELTA_HIGH="${RIPO_DELTA_HIGH:-3e-5}"
-export PREFIX_EXACT_KL_DELTA_LOW="${PREFIX_EXACT_KL_DELTA_LOW:-0.02}"
-export PREFIX_EXACT_KL_DELTA_HIGH="${PREFIX_EXACT_KL_DELTA_HIGH:-0.05}"
+export PREFIX_EXACT_KL_DELTA_LOW="${PREFIX_EXACT_KL_DELTA_LOW:-3.09912028333e-4}"
+export PREFIX_EXACT_KL_DELTA_HIGH="${PREFIX_EXACT_KL_DELTA_HIGH:-5.17091807565e-3}"
 export LOSS_MODE="${LOSS_MODE:-prefix_ripo_clip}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-prefix-ripo-l1em5-h3em5-qwen3-4b-8gpu}"
 

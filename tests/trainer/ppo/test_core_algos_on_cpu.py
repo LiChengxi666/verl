@@ -80,7 +80,7 @@ def test_prefix_ripo_clip_matches_average_token_kl_bound():
     assert torch.allclose(clipped_grad, torch.zeros_like(clipped_grad))
 
 
-def test_prefix_exact_kl_clip_uses_cumulative_prefix_ratio_with_token_local_gradient():
+def test_prefix_exact_kl_clip_uses_geometric_average_prefix_ratio_with_token_local_gradient():
     old_log_prob = torch.tensor([[-2.0, -2.0, -2.0]])
     token_log_ratio = torch.tensor([[0.1, 0.2, -0.1]])
     log_prob = (old_log_prob + token_log_ratio).requires_grad_(True)
@@ -102,14 +102,49 @@ def test_prefix_exact_kl_clip_uses_cumulative_prefix_ratio_with_token_local_grad
         config=config,
     )
 
-    cumulative_prefix_ratio = torch.exp(torch.cumsum(token_log_ratio, dim=-1))
-    assert loss.item() == pytest.approx(cumulative_prefix_ratio.mean().item())
+    prefix_len = torch.arange(1, token_log_ratio.shape[-1] + 1)
+    geometric_average_prefix_ratio = torch.exp(torch.cumsum(token_log_ratio, dim=-1) / prefix_len)
+    assert loss.item() == pytest.approx(geometric_average_prefix_ratio.mean().item())
     assert metrics["actor/prefix_exact_kl_clip/probability_weighted"] == 0.0
+    assert metrics["actor/prefix_exact_kl_clip/geometric_average_surrogate"] == 1.0
 
     loss.backward()
-    # Stop-gradient keeps the cumulative prefix value but routes each loss
+    # Stop-gradient keeps the geometric-average prefix value but routes each loss
     # term's gradient through its current token only.
-    assert torch.allclose(log_prob.grad, cumulative_prefix_ratio / token_log_ratio.shape[-1], atol=1e-6)
+    assert torch.allclose(log_prob.grad, geometric_average_prefix_ratio / token_log_ratio.shape[-1], atol=1e-6)
+
+
+def test_prefix_exact_kl_clip_preserves_cumulative_prefix_clip_decisions():
+    old_log_prob = torch.full((1, 4), -2.0)
+    token_log_ratio = torch.tensor([[0.01, 0.03, 0.08, 0.12]])
+    log_prob = old_log_prob + token_log_ratio
+    response_mask = torch.ones_like(old_log_prob)
+    advantages = torch.ones_like(old_log_prob)
+    delta_high = 1e-3
+
+    config = ActorConfig(
+        strategy="fsdp",
+        rollout_n=1,
+        ppo_micro_batch_size=1,
+        policy_loss=PolicyLossConfig(
+            prefix_exact_kl_delta_low=delta_high,
+            prefix_exact_kl_delta_high=delta_high,
+        ),
+    )
+
+    _, metrics = compute_policy_loss_prefix_exact_kl_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        config=config,
+    )
+
+    cumulative_log_ratio = torch.cumsum(token_log_ratio, dim=-1)
+    prefix_len = torch.arange(1, token_log_ratio.shape[-1] + 1)
+    exact_kl_coordinate = torch.exp(cumulative_log_ratio) - 1.0 - cumulative_log_ratio
+    expected_clipped = exact_kl_coordinate > prefix_len * delta_high
+    assert metrics["actor/pg_clipfrac"] == pytest.approx(expected_clipped.float().mean().item())
 
 
 class TestRegisterAdvEst(unittest.TestCase):
