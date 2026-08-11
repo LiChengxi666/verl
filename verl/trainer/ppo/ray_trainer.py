@@ -1226,8 +1226,15 @@ class RayPPOTrainer:
         )
         # load critic
         if self.use_critic:
+            remote_critic_path = (
+                os.path.join(remote_global_step_folder, str(Role.Critic))
+                if remote_global_step_folder is not None
+                else None
+            )
             self.critic_wg.load_checkpoint(
-                critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+                critic_path,
+                remote_critic_path,
+                self.config.trainer.del_local_ckpt_after_load,
             )
 
         # load dataloader,
