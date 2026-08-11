@@ -1625,6 +1625,7 @@ class RayPPOTrainer:
                         combined_gen_output.meta_info.pop("timing", None)
 
                     gen_batch_output = combined_gen_output.slice(0, num_sampled_prompts)
+                    rollout_source_indices = gen_batch_output.meta_info.pop("rollout_source_indices", None)
                     if "__do_sample__" in gen_batch_output.non_tensor_batch:
                         gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
 
@@ -1644,6 +1645,8 @@ class RayPPOTrainer:
                     del combined_gen_batch, combined_gen_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    if rollout_source_indices is not None:
+                        batch = batch.select_idxs(rollout_source_indices)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():

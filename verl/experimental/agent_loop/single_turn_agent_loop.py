@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import logging
 import os
 from typing import Any
@@ -56,15 +57,27 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
         # 3. generate sequences
         metrics = {}
-        with simple_timer("generate_sequences", metrics):
-            output: TokenOutput = await self.server_manager.generate(
-                request_id=uuid4().hex,
+        try:
+            with simple_timer("generate_sequences", metrics):
+                output: TokenOutput = await self.server_manager.generate(
+                    request_id=uuid4().hex,
+                    prompt_ids=prompt_ids,
+                    sampling_params=sampling_params,
+                    image_data=images,
+                    video_data=videos,
+                    audio_data=audios,
+                    mm_processor_kwargs=mm_processor_kwargs,
+                )
+        except asyncio.CancelledError:
+            return AgentLoopOutput(
                 prompt_ids=prompt_ids,
-                sampling_params=sampling_params,
-                image_data=images,
-                video_data=videos,
-                audio_data=audios,
+                response_ids=[],
+                response_mask=[],
+                multi_modal_data=multi_modal_data,
                 mm_processor_kwargs=mm_processor_kwargs,
+                num_turns=0,
+                metrics=metrics,
+                extra_fields={"turn_scores": [], "tool_rewards": [], "aborted": True},
             )
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1

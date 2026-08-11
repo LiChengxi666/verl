@@ -29,6 +29,7 @@ and is designed to be fully replaceable by other agent frameworks such as:
 
 import asyncio
 import logging
+import math
 import os
 import random
 from abc import ABC, abstractmethod
@@ -522,23 +523,70 @@ class AgentLoopWorker:
         # NOTE: __do_sample__ is an internal per-sample override used by REMAX combined rollout.
         # Do not forward it to concrete agent loops, which may reject unknown kwargs.
         per_sample_do_sample = batch.non_tensor_batch.get("__do_sample__")
-        tasks = []
-        for i in range(len(batch)):
+
+        def create_task(i: int) -> asyncio.Task:
             trace_this_sample = i in traced_indices
-            kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items() if k != "__do_sample__"}
+            kwargs = {
+                k: v[i]
+                for k, v in batch.non_tensor_batch.items()
+                if k not in {"__do_sample__", "__rollout_source_index__"}
+            }
             sample_sampling_params = dict(sampling_params)
             if not validate and per_sample_do_sample is not None and not bool(per_sample_do_sample[i]):
                 apply_greedy_sampling_params(sample_sampling_params)
-            tasks.append(
-                asyncio.create_task(
-                    self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
-                )
+            return asyncio.create_task(
+                self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
             )
+
+        source_indices = list(range(len(batch)))
+        tasks = [create_task(i) for i in source_indices]
+        oversample_discarded = 0
+        over_sample_rate = float(config.over_sample_rate) if not validate else 0.0
+        if over_sample_rate > 0 and tasks:
+            if not 0 <= over_sample_rate < 1:
+                raise ValueError(f"over_sample_rate must be in [0, 1), got {over_sample_rate}")
+
+            target_completions = len(tasks)
+            total_requests = target_completions + batch.meta_info["oversample_extra_requests"]
+            extra_source_indices = np.random.choice(
+                len(batch), size=total_requests - target_completions, replace=True
+            ).tolist()
+            source_indices.extend(extra_source_indices)
+            tasks.extend(create_task(i) for i in extra_source_indices)
+
+            pending = set(tasks)
+            completed = set()
+            while len(completed) < target_completions:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                completed.update(done)
+
+            selected_tasks = [task for task in tasks if task in completed][:target_completions]
+            selected_task_set = set(selected_tasks)
+            discarded_tasks = [task for task in tasks if task not in selected_task_set]
+            for task in discarded_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*discarded_tasks, return_exceptions=True)
+
+            selected_indices = [source_indices[tasks.index(task)] for task in selected_tasks]
+            tasks = selected_tasks
+            oversample_discarded = len(discarded_tasks)
+        else:
+            selected_indices = source_indices
+
         outputs = await asyncio.gather(*tasks)
+        selected_source_indices = batch.non_tensor_batch["__rollout_source_index__"][selected_indices]
+        selected_non_tensor_batch = {
+            key: value[selected_indices]
+            for key, value in batch.non_tensor_batch.items()
+            if key != "__rollout_source_index__"
+        }
 
         output = self._postprocess(
-            outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+            outputs, input_non_tensor_batch=selected_non_tensor_batch, validate=batch.meta_info.get("validate", False)
         )
+        output.meta_info["oversample_discarded"] = oversample_discarded
+        output.meta_info["rollout_source_indices"] = selected_source_indices
         return output
 
     async def _run_agent_loop(
@@ -1075,12 +1123,29 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
+        prompts.non_tensor_batch["__rollout_source_index__"] = np.arange(len(prompts))
         chunkes = prompts.chunk(len(self.agent_loop_workers))
+        over_sample_rate = float(self.rollout_config.over_sample_rate) if not prompts.meta_info.get("validate", False) else 0.0
+        if over_sample_rate > 0:
+            total_requests = math.ceil(len(prompts) / (1 - over_sample_rate))
+            total_extra_requests = total_requests - len(prompts)
+            extra_per_worker, workers_with_one_more = divmod(total_extra_requests, len(chunkes))
+            for worker_index, chunk in enumerate(chunkes):
+                chunk.meta_info = dict(chunk.meta_info)
+                chunk.meta_info["oversample_extra_requests"] = extra_per_worker + (
+                    worker_index < workers_with_one_more
+                )
         outputs = await asyncio.gather(
             *[
                 worker.generate_sequences.remote(chunk)
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
+        )
+        rollout_source_indices = np.concatenate(
+            [worker_output.meta_info.pop("rollout_source_indices") for worker_output in outputs]
+        )
+        oversample_discarded = sum(
+            worker_output.meta_info.pop("oversample_discarded", 0) for worker_output in outputs
         )
         output = DataProto.concat(outputs)
 
@@ -1089,6 +1154,9 @@ class AgentLoopManager:
         timing = self._performance_metrics(metrics, output)
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        if not prompts.meta_info.get("validate", False) and float(self.rollout_config.over_sample_rate) > 0:
+            output.meta_info["rollout_source_indices"] = rollout_source_indices
+        output.meta_info["timing"]["agent_loop/oversample_discarded"] = oversample_discarded
         return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:

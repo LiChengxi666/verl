@@ -1964,6 +1964,63 @@ def compute_policy_loss_prefix_dynamic_clip(
     return pg_loss, pg_metrics
 
 
+def _solve_exact_prefix_kl_log_bounds(log_budget: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Solve ``exp(z) - 1 - z = exp(log_budget)`` on both branches.
+
+    ``z`` is the cumulative prefix log-ratio. The equation has one negative
+    and one positive root for every positive budget. A direct ratio-space
+    solve is numerically unusable for long prefixes because
+    ``t * delta / pi_old(prefix)`` quickly exceeds the floating-point range.
+    This routine therefore works from its logarithm and uses:
+
+    - a local series for very small budgets;
+    - Newton iterations while the budget is directly representable;
+    - asymptotically exact log-space updates for large budgets.
+
+    The returned tensors are detached trust-region boundaries.
+    """
+
+    with torch.no_grad():
+        work_dtype = torch.float32 if log_budget.dtype in (torch.float16, torch.bfloat16) else log_budget.dtype
+        log_c = log_budget.detach().to(work_dtype)
+
+        # The local roots are z+ = sqrt(2c) - c/3 + O(c^(3/2)) and
+        # z- = -sqrt(2c) - c/3 + O(c^(3/2)).
+        c_for_newton = torch.exp(torch.clamp(log_c, max=12.0))
+        sqrt_2c = torch.sqrt(2.0 * c_for_newton)
+        use_series = c_for_newton < 1e-4
+        upper_series = (sqrt_2c - c_for_newton / 3.0).clamp_min(0.0)
+        lower_series = -(sqrt_2c + c_for_newton / 3.0)
+
+        # Positive root. expm1 keeps the Newton residual accurate near zero.
+        upper_newton = torch.where(c_for_newton < 1.0, sqrt_2c, torch.log1p(c_for_newton) + 0.5)
+        for _ in range(4):
+            expm1_upper = torch.expm1(upper_newton)
+            residual = expm1_upper - upper_newton - c_for_newton
+            upper_newton = (upper_newton - residual / expm1_upper.clamp_min(1e-12)).clamp_min(0.0)
+
+        # For large c, exp(z) = c + 1 + z. Fixed-point updates in log-space
+        # avoid ever materializing c and converge rapidly because z << c.
+        upper_large = log_c.clamp_min(0.0)
+        for _ in range(4):
+            upper_large = torch.logaddexp(log_c, torch.log1p(upper_large))
+        upper = torch.where(log_c > 12.0, upper_large, torch.where(use_series, upper_series, upper_newton))
+
+        # Negative root with u = -z: exp(-u) - 1 + u = c. For large c,
+        # u = c + 1 - exp(-u) is indistinguishable from c + 1. Overflow to
+        # -inf is intentional: it denotes an inactive lower ratio boundary.
+        lower_u = torch.where(c_for_newton < 1.0, sqrt_2c, c_for_newton + 1.0)
+        for _ in range(4):
+            residual = torch.exp(-lower_u) - 1.0 + lower_u - c_for_newton
+            derivative = (-torch.expm1(-lower_u)).clamp_min(1e-12)
+            lower_u = (lower_u - residual / derivative).clamp_min(0.0)
+        lower_newton = -lower_u
+        lower_large = -(torch.exp(log_c) + 1.0)
+        lower = torch.where(log_c > 12.0, lower_large, torch.where(use_series, lower_series, lower_newton))
+
+        return lower.to(log_budget.dtype), upper.to(log_budget.dtype)
+
+
 @register_policy_loss("prefix_ripo_clip")
 def compute_policy_loss_prefix_ripo_clip(
     old_log_prob: torch.Tensor,
@@ -2052,11 +2109,12 @@ def compute_policy_loss_prefix_ripo_clip(
         neg_inf,
     )
 
-    # Clip prefix cumulative log-ratio L_i,t, then convert the clipped likelihood
-    # ratio back into the average-prefix ratio used by the surrogate.
-    prefix_log_ratio_sum = torch.clamp(prefix_log_ratio_sum, min=-80.0, max=80.0)
+    # Clip the original prefix cumulative log-ratio L_i,t directly. Do not add
+    # a fixed cap here: L_i,t naturally grows with prefix length, while the
+    # RIPO-like bounds already account for both t and pi_old(o_i,<=t | q).
+    # A fixed cumulative cap would change the derived trust region and can also
+    # make clip diagnostics disagree with the surrogate for long responses.
     prefix_log_ratio_sum_clip = torch.minimum(torch.maximum(prefix_log_ratio_sum, lower_log_bound), upper_log_bound)
-    prefix_avg_log_ratio_clip = prefix_log_ratio_sum_clip / prefix_len
 
     # Gradient locking follows GSPO/prefix_dynamic_clip: the numerical ratio is
     # detached prefix information, while gradients flow through the current
@@ -2227,6 +2285,237 @@ def compute_policy_loss_prefix_ripo_clip(
         ).detach().item()
 
     return pg_loss, pg_metrics
+
+
+def _compute_policy_loss_prefix_exact_kl_clip(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    *,
+    probability_weighted: bool,
+    loss_name: str,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Geometric-average-prefix surrogate with exact cumulative-prefix clipping.
+
+    The unweighted strategy applies
+
+        R - 1 - log(R) <= t * delta.
+
+    The probability-weighted strategy instead applies
+
+        R - 1 - log(R) <= t * delta / pi_old(prefix).
+
+    where ``R = exp(sum_{k<=t} log r_k)`` is the cumulative prefix likelihood
+    ratio. Separate low/high deltas define the two roots. Dividing the solved
+    cumulative log bounds by ``t`` gives exactly equivalent bounds for the
+    geometric-average prefix ratio ``R ** (1 / t)`` used by the surrogate.
+
+    The geometric-average prefix ratio is detached and gradients flow only
+    through the current-token log probability.
+    """
+
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+
+    policy_loss_cfg = config.policy_loss
+    delta_low = float(policy_loss_cfg.get("prefix_exact_kl_delta_low", 3.09912028333e-4))
+    delta_high = float(policy_loss_cfg.get("prefix_exact_kl_delta_high", 5.17091807565e-3))
+    if delta_low <= 0.0 or delta_high <= 0.0:
+        raise ValueError("prefix_exact_kl_delta_low/high must both be positive.")
+
+    negative_approx_kl = log_prob - old_log_prob
+    log_ratio = negative_approx_kl * response_mask
+    prefix_len = torch.cumsum(response_mask, dim=-1).clamp(min=1.0)
+    prefix_log_ratio_sum = torch.cumsum(log_ratio, dim=-1)
+    prefix_avg_log_ratio = prefix_log_ratio_sum / prefix_len
+    old_prefix_log_prob = torch.cumsum(old_log_prob * response_mask, dim=-1)
+
+    # Work with the logarithm of the right-hand side. For the weighted
+    # coordinate constraint this also avoids materializing pi_old(prefix),
+    # which underflows rapidly for long responses.
+    log_prefix_len = torch.log(prefix_len)
+    log_budget_low = log_prefix_len + np.log(delta_low)
+    log_budget_high = log_prefix_len + np.log(delta_high)
+    if probability_weighted:
+        log_budget_low = log_budget_low - old_prefix_log_prob
+        log_budget_high = log_budget_high - old_prefix_log_prob
+    lower_log_bound, _ = _solve_exact_prefix_kl_log_bounds(log_budget_low)
+    _, upper_log_bound = _solve_exact_prefix_kl_log_bounds(log_budget_high)
+
+    lower_avg_log_bound = lower_log_bound / prefix_len
+    upper_avg_log_bound = upper_log_bound / prefix_len
+    prefix_avg_log_ratio_clip = torch.minimum(
+        torch.maximum(prefix_avg_log_ratio, lower_avg_log_bound), upper_avg_log_bound
+    )
+
+    # The detached average-prefix term supplies the numerical importance
+    # weight R_pre ** (1 / t). The zero-valued log_prob - log_prob.detach()
+    # term preserves the existing current-token-only gradient route.
+    prefix_log_importance_ratio = log_prob - log_prob.detach() + prefix_avg_log_ratio.detach()
+    prefix_log_importance_ratio = torch.clamp(prefix_log_importance_ratio, min=-10.0, max=10.0)
+    prefix_log_importance_ratio_clip = torch.minimum(
+        torch.maximum(prefix_log_importance_ratio, lower_avg_log_bound), upper_avg_log_bound
+    )
+    prefix_log_importance_ratio_clip = torch.clamp(prefix_log_importance_ratio_clip, min=-10.0, max=10.0)
+
+    ratio_for_loss = torch.exp(prefix_log_importance_ratio)
+    ratio_clip_for_loss = torch.exp(prefix_log_importance_ratio_clip)
+    pg_losses1 = -advantages * ratio_for_loss
+    pg_losses2 = -advantages * ratio_clip_for_loss
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode="seq-mean-token-mean",
+        **config.global_batch_info,
+    )
+
+    clipped = torch.ne(prefix_avg_log_ratio, prefix_avg_log_ratio_clip)
+    lower_clipped = clipped & (prefix_avg_log_ratio < lower_avg_log_bound)
+    pg_clipfrac = verl_F.masked_mean(clipped.float(), response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean(lower_clipped.float(), response_mask)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    finite_lower = torch.isfinite(lower_log_bound)
+    eps_pos = upper_avg_log_bound.detach()
+    eps_neg = torch.where(finite_lower, -lower_avg_log_bound.detach(), torch.zeros_like(lower_avg_log_bound))
+
+    _dump_prefix_clip_response_diagnostics(
+        loss_name=loss_name,
+        response_mask=response_mask,
+        clipped=clipped,
+        lower_clipped=lower_clipped,
+        prefix_avg_log_ratio=prefix_avg_log_ratio,
+        eps_pos=eps_pos,
+        eps_neg=eps_neg,
+    )
+
+    response_mask_float = response_mask.float()
+    finite_lower_float = finite_lower.float()
+    finite_lower_count = (finite_lower_float * response_mask_float).sum().clamp(min=1.0)
+    finite_lower_mean = (
+        torch.where(finite_lower, lower_avg_log_bound.detach(), torch.zeros_like(lower_avg_log_bound))
+        * finite_lower_float
+        * response_mask_float
+    ).sum() / finite_lower_count
+
+    metric_prefix = f"actor/{loss_name}"
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        f"{metric_prefix}/delta_low": delta_low,
+        f"{metric_prefix}/delta_high": delta_high,
+        f"{metric_prefix}/probability_weighted": float(probability_weighted),
+        f"{metric_prefix}/geometric_average_surrogate": 1.0,
+        f"{metric_prefix}/avg_log_ratio_abs_mean": verl_F.masked_mean(
+            prefix_avg_log_ratio.detach().abs(), response_mask
+        ).item(),
+        f"{metric_prefix}/sum_log_ratio_abs_mean": verl_F.masked_mean(
+            prefix_log_ratio_sum.detach().abs(), response_mask
+        ).item(),
+        f"{metric_prefix}/old_prefix_nll_per_token_mean": verl_F.masked_mean(
+            (-old_prefix_log_prob.detach() / prefix_len), response_mask
+        ).item(),
+        f"{metric_prefix}/log_budget_low_mean": verl_F.masked_mean(
+            log_budget_low.detach(), response_mask
+        ).item(),
+        f"{metric_prefix}/log_budget_high_mean": verl_F.masked_mean(
+            log_budget_high.detach(), response_mask
+        ).item(),
+        f"{metric_prefix}/upper_avg_log_bound_mean": verl_F.masked_mean(
+            upper_avg_log_bound.detach(), response_mask
+        ).item(),
+        f"{metric_prefix}/finite_lower_bound_frac": verl_F.masked_mean(
+            finite_lower_float, response_mask
+        ).item(),
+        f"{metric_prefix}/finite_lower_avg_log_bound_mean": finite_lower_mean.detach().item(),
+    }
+
+    # Position metrics expose how the exact bound evolves along the response.
+    seq_len = response_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+    relative_pos = (prefix_len / seq_len).clamp(min=0.0, max=1.0)
+    valid_response_mask = response_mask.bool()
+    for bucket_idx in range(10):
+        left = bucket_idx / 10.0
+        right = (bucket_idx + 1) / 10.0
+        if bucket_idx == 0:
+            bucket_mask = valid_response_mask & (relative_pos >= left) & (relative_pos <= right)
+        else:
+            bucket_mask = valid_response_mask & (relative_pos > left) & (relative_pos <= right)
+        bucket_mask_float = bucket_mask.float()
+        bucket_prefix = f"{metric_prefix}/pos_bucket_{bucket_idx:02d}_{bucket_idx + 1:02d}"
+        pg_metrics[f"{bucket_prefix}/pg_clipfrac"] = verl_F.masked_mean(
+            clipped.float(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/pg_clipfrac_lower"] = verl_F.masked_mean(
+            lower_clipped.float(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/upper_avg_log_bound_mean"] = verl_F.masked_mean(
+            upper_avg_log_bound.detach(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/finite_lower_bound_frac"] = verl_F.masked_mean(
+            finite_lower_float, bucket_mask_float
+        ).detach().item()
+
+    return pg_loss, pg_metrics
+
+
+@register_policy_loss("prefix_probability_weighted_exact_kl_clip")
+def compute_policy_loss_prefix_probability_weighted_exact_kl_clip(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Exact prefix KL-coordinate clip weighted by old prefix probability."""
+
+    return _compute_policy_loss_prefix_exact_kl_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_is_weights=rollout_is_weights,
+        probability_weighted=True,
+        loss_name="prefix_probability_weighted_exact_kl_clip",
+    )
+
+
+@register_policy_loss("prefix_exact_kl_clip")
+def compute_policy_loss_prefix_exact_kl_clip(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Exact prefix KL-coordinate clip with ``R - 1 - log(R) <= t * delta``."""
+
+    return _compute_policy_loss_prefix_exact_kl_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_is_weights=rollout_is_weights,
+        probability_weighted=False,
+        loss_name="prefix_exact_kl_clip",
+    )
 
 
 @register_policy_loss("prefix_sqrt_dynamic_clip")

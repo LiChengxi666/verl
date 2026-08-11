@@ -19,6 +19,7 @@ import dataclasses
 import json
 import logging
 import os
+import sys
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -27,6 +28,17 @@ from typing import Any
 import orjson
 
 logger = logging.getLogger(__name__)
+
+_VENDORED_WANDB = Path(__file__).resolve().parents[2] / ".ray_vendor"
+if (_VENDORED_WANDB / "wandb").is_dir():
+    sys.path.insert(0, str(_VENDORED_WANDB))
+    wandb_core = _VENDORED_WANDB / "wandb" / "bin" / "wandb-core"
+    if wandb_core.is_file() and not os.access(wandb_core, os.X_OK):
+        wandb_core.chmod(0o755)
+    loaded_wandb = sys.modules.get("wandb")
+    loaded_path = Path(getattr(loaded_wandb, "__file__", "")) if loaded_wandb else None
+    if loaded_path is not None and _VENDORED_WANDB not in loaded_path.parents:
+        raise RuntimeError(f"Platform W&B SDK was loaded before the vendored SDK: {loaded_path}")
 
 MLFLOW_MAX_ATTEMPTS = 3
 MLFLOW_SLEEP_SECONDS = 5
@@ -72,6 +84,8 @@ class Tracking:
             import os
 
             import wandb
+
+            print(f"WANDB_SDK_TRACKING version={wandb.__version__} path={wandb.__file__}")
 
             settings = None
             if config and config["trainer"].get("wandb_proxy", None):

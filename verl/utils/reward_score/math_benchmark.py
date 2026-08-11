@@ -23,9 +23,13 @@ def compute_score(solution_str: str, ground_truth: str) -> dict[str, float | boo
         prediction = "[INVALID]"
         correct = False
     else:
-        prediction = normalize_final_answer(remove_boxed(boxed_answer))
-        reference = normalize_final_answer(ground_truth)
-        correct = prediction == reference
+        try:
+            prediction = normalize_final_answer(remove_boxed(boxed_answer))
+            reference = normalize_final_answer(ground_truth)
+            correct = prediction == reference
+        except Exception:
+            prediction = "[INVALID]"
+            correct = False
 
     return {
         "score": 1.0 if correct else 0.0,

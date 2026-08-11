@@ -81,8 +81,8 @@ validation_generations/verl_math_repro/<experiment_name>/
 
 ```text
 trainer.resume_mode=auto
-trainer.save_freq=10
-trainer.test_freq=10
+trainer.save_freq=5
+trainer.test_freq=5
 ```
 
 如果设置了 `WANDB_API_KEY`，或设置了可读的 `WANDB_API_KEY_FILE`，脚本会自动
