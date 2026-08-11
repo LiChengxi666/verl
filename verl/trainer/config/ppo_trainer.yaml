@@ -194,6 +194,9 @@ trainer:
   # Whether to delete local checkpoints after loading
   del_local_ckpt_after_load: False
 
+  # Remove the driver-local step directory after its HDFS metadata and latest pointer are durably published.
+  remove_local_ckpt_after_hdfs_save: False
+
   # Default local directory for saving checkpoints
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
 

@@ -33,6 +33,7 @@ from verl.utils.device import is_cuda_available
 from verl.utils.fs import copy_to_local, is_non_local, local_mkdir_safe
 from verl.utils.fsdp_utils import fsdp_version, get_fsdp_full_state_dict, get_fsdp_state_ctx
 from verl.utils.logger import log_with_rank
+from verl.utils.local_storage import remove_uploaded_checkpoint_files
 from verl.utils.transformers_compat import drop_tied_target_keys, get_auto_model_for_vision2seq
 
 from .checkpoint_manager import BaseCheckpointManager
@@ -129,6 +130,13 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         if local_path is None:
             return
         hdfs_path = _resolve_hdfs_checkpoint_path(local_path, hdfs_path)
+        remove_local_after_hdfs_save = bool(
+            self.checkpoint_config and self.checkpoint_config.get("remove_local_after_hdfs_save", False)
+        )
+        if remove_local_after_hdfs_save and hdfs_path is None:
+            raise ValueError("remove_local_after_hdfs_save requires an HDFS checkpoint path")
+        if remove_local_after_hdfs_save and self.should_save_hf_model:
+            raise ValueError("remove_local_after_hdfs_save does not support save_contents containing hf_model")
         checkpoint_path = hdfs_path or local_path
 
         # check if the checkpoint_load_contents is valid
@@ -323,6 +331,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # wait for everyone to dump to local
         torch.distributed.barrier()
 
+        uploaded_local_paths = []
         if hdfs_path is not None:
             hdfs_io.makedirs(hdfs_path, exist_ok=True)
             upload_paths = []
@@ -336,6 +345,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 remote_path = os.path.join(hdfs_path, os.path.basename(upload_path))
                 if not hdfs_io.copy(src=upload_path, dst=remote_path):
                     raise RuntimeError(f"Failed to upload FSDP checkpoint shard: {upload_path} -> {remote_path}")
+            uploaded_local_paths = upload_paths
             torch.distributed.barrier()
 
         if self.should_save_hf_model:
@@ -393,3 +403,13 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
         if self.rank == 0:
             self.register_checkpoint(local_path, max_ckpt_to_keep)
+
+        if remove_local_after_hdfs_save:
+            remove_uploaded_checkpoint_files(uploaded_local_paths, root=local_path)
+            torch.distributed.barrier()
+            if self.rank == 0:
+                remove_uploaded_checkpoint_files(
+                    [os.path.join(local_path, "huggingface"), os.path.join(local_path, "fsdp_config.json")],
+                    root=local_path,
+                )
+            torch.distributed.barrier()

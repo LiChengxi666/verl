@@ -391,8 +391,14 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
 
     from verl.utils.dataset.rl_dataset import get_dataset_class
 
-    # Get the dataset class
-    dataset_cls = get_dataset_class(data_config)
+    offline_config = data_config.get("offline_trajectory")
+    if is_train and offline_config and offline_config.get("enable", False):
+        from verl.utils.dataset.teacher_trajectory_dataset import TeacherTrajectoryDataset
+
+        dataset_cls = TeacherTrajectoryDataset
+    else:
+        # Validation stays online and continues to use the ordinary RL dataset.
+        dataset_cls = get_dataset_class(data_config)
 
     # Instantiate the dataset using the determined dataset class
     dataset = dataset_cls(

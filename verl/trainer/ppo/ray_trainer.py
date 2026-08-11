@@ -378,13 +378,25 @@ class RayPPOTrainer:
         from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
 
         if train_dataset is None:
-            train_dataset = create_rl_dataset(
-                self.config.data.train_files,
-                self.config.data,
-                self.tokenizer,
-                self.processor,
-                max_samples=self.config.data.get("train_max_samples", -1),
-            )
+            offline_trajectory_config = self.config.data.get("offline_trajectory")
+            if offline_trajectory_config and offline_trajectory_config.get("enable", False):
+                from verl.utils.dataset.teacher_trajectory_dataset import TeacherTrajectoryDataset
+
+                train_dataset = TeacherTrajectoryDataset(
+                    self.config.data.train_files,
+                    self.tokenizer,
+                    self.config.data,
+                    self.processor,
+                    max_samples=self.config.data.get("train_max_samples", -1),
+                )
+            else:
+                train_dataset = create_rl_dataset(
+                    self.config.data.train_files,
+                    self.config.data,
+                    self.tokenizer,
+                    self.processor,
+                    max_samples=self.config.data.get("train_max_samples", -1),
+                )
         if val_dataset is None:
             val_dataset = create_rl_dataset(
                 self.config.data.val_files,
@@ -558,6 +570,12 @@ class RayPPOTrainer:
 
         # pop those keys for generation
         batch_keys_to_pop = []
+        if "__offline_trajectory__" in batch.non_tensor_batch:
+            batch_keys_to_pop = [
+                key
+                for key in ("responses", "response_mask", "rollout_log_probs", "rm_scores")
+                if key in batch.batch
+            ]
         non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
@@ -568,6 +586,14 @@ class RayPPOTrainer:
         gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
+
+    def _generate_training_sequences(self, batch: DataProto) -> DataProto:
+        from verl.utils.dataset.teacher_trajectory_dataset import consume_offline_trajectory_batch
+
+        offline_batch = consume_offline_trajectory_batch(batch)
+        if offline_batch is not None:
+            return offline_batch
+        return self.async_rollout_manager.generate_sequences(batch)
 
     def _compute_reward_colocate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
         """
@@ -959,6 +985,10 @@ class RayPPOTrainer:
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
+        if getattr(self.config.trainer, "remove_local_ckpt_after_hdfs_save", False):
+            if self.config.trainer.default_hdfs_dir is None:
+                raise ValueError("remove_local_ckpt_after_hdfs_save requires trainer.default_hdfs_dir")
+
         if self.rollout_buffer is not None and self.global_steps < self.rollout_buffer.delay_steps:
             print(
                 "Skipping fixed-delay checkpoint before the rollout queue reaches steady state: "
@@ -1061,6 +1091,13 @@ class RayPPOTrainer:
                 local_global_step_folder,
                 Path(self.config.trainer.default_local_dir) / "latest_checkpointed_iteration.txt",
             )
+            if getattr(self.config.trainer, "remove_local_ckpt_after_hdfs_save", False):
+                from verl.utils.local_storage import remove_published_checkpoint_tree
+
+                remove_published_checkpoint_tree(
+                    local_global_step_folder,
+                    checkpoint_root=self.config.trainer.default_local_dir,
+                )
         prune_complete_checkpoints(
             self.config.trainer.default_local_dir,
             getattr(self.config.trainer, "max_complete_ckpt_to_keep", None),
@@ -1616,7 +1653,7 @@ class RayPPOTrainer:
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.llm_server_manager.start_profile()
-                        combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
+                        combined_gen_output = self._generate_training_sequences(combined_gen_batch)
                         self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
                             self.llm_server_manager.stop_profile()
