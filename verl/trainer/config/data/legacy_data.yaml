@@ -109,6 +109,37 @@ custom_cls:
   # The name of the dataset class within the specified file.
   name: null
 
+# Fixed behavior-policy trajectories used instead of online training rollout.
+# Validation continues to use the configured rollout backend.
+offline_trajectory:
+
+  # Enable the schema-v2 teacher trajectory dataset for the training split.
+  enable: false
+
+  # HDFS or local root containing manifest.json and raw/*.jsonl.gz.
+  root: null
+
+  # Driver-local cache for downloaded HDFS shards. Its physical shard files are bounded below.
+  cache_dir: /tmp/verl_teacher_trajectory
+
+  # Maximum number of decoded and downloaded gzip shards retained locally.
+  max_cached_shards: 2
+
+  # Pad the dataset with zero-response-mask samples to make every global batch complete.
+  pad_to_multiple: 1
+
+  # Fixed width of offline response tensors; independent of online validation generation length.
+  max_response_length: ${oc.select:data.max_response_length,4096}
+
+  # Response length used by the DAPO-compatible soft overlong penalty.
+  max_resp_len: ${oc.select:data.max_response_length,4096}
+
+  # Width of the linear soft overlong penalty buffer; zero disables it.
+  overlong_buffer_len: 0
+
+  # Multiplier for the soft overlong penalty.
+  overlong_penalty_factor: 1.0
+
 # Whether to return multi-modal inputs in the dataset. Set to False if rollout generates new multi-modal inputs.
 return_multi_modal_inputs: True
 
