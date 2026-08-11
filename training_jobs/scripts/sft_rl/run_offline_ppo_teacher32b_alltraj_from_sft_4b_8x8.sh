@@ -117,7 +117,6 @@ python - \
     actor_rollout_ref.rollout.temperature=0.7 \
     actor_rollout_ref.rollout.top_p=0.95 \
     actor_rollout_ref.rollout.top_k=20 \
-    '+actor_rollout_ref.rollout.stop_token_ids=[151643,151645]' \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.val_kwargs.n=8 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
