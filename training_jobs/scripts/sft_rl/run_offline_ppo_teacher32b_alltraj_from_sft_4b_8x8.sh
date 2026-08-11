@@ -24,6 +24,20 @@ VALIDATION_MAX_RESPONSE_LENGTH="${VALIDATION_MAX_RESPONSE_LENGTH:-30720}"
 load_cluster_environment
 load_wandb_environment "${REPO_ROOT}"
 
+# Merlin images ship a ByteDance-patched ``byted-wandb`` package that routes
+# runs to Seed/MLX even when WANDB_BASE_URL points at api.wandb.ai.  This
+# experiment must resume the existing official W&B run, so prefer the isolated
+# official client staged on every Ray node and fail before reserving GPUs if it
+# is unavailable.
+WANDB_VENDOR_ROOT="${WANDB_VENDOR_ROOT:-${REPO_ROOT}/vendor/wandb-0.21.1}"
+if [ ! -f "${WANDB_VENDOR_ROOT}/wandb/__init__.py" ]; then
+    echo "Missing official W&B client at ${WANDB_VENDOR_ROOT}" >&2
+    exit 1
+fi
+export PYTHONPATH="${WANDB_VENDOR_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export MERLIN_CLI_REPLACE_MLX_MODE=off
+export MERLIN_CLI_REPLACE_MLX_PERCENT=0
+
 if [ ! -f "${MODEL_PATH}/config.json" ]; then
     echo "Missing SFT model at ${MODEL_PATH}" >&2
     exit 1
@@ -172,6 +186,7 @@ import os
 import ray
 
 runtime_env_names = (
+    "PYTHONPATH",
     "HF_HOME",
     "HF_DATASETS_CACHE",
     "HUGGINGFACE_HUB_CACHE",
@@ -185,6 +200,11 @@ runtime_env_names = (
     "WANDB_NAME",
     "WANDB_RESUME",
     "WANDB_DIR",
+    "WANDB_CACHE_DIR",
+    "WANDB_DATA_DIR",
+    "WANDB_CONFIG_DIR",
+    "MERLIN_CLI_REPLACE_MLX_MODE",
+    "MERLIN_CLI_REPLACE_MLX_PERCENT",
     "VERL_FILE_LOGGER_PATH",
     "TENSORBOARD_LOG_PATH",
     "VLLM_USE_V1",
