@@ -102,6 +102,18 @@ policy_loss:
   # Exact upper KL-coordinate budget mapped from epsilon+ = 0.10 (2x CTPO)
   prefix_exact_kl_delta_high: 5.17091807565e-3
 
+  # RIPO lower Riemannian trust-region budget (Eq. 11; paper default is symmetric 0.05)
+  ripo_delta_low: 0.05
+
+  # RIPO upper Riemannian trust-region budget (Eq. 11; paper default is symmetric 0.05)
+  ripo_delta_high: 0.05
+
+  # RIPO paper's lower truncation bound for the token importance ratio
+  ripo_ratio_lower: 0.5
+
+  # RIPO paper's upper truncation bound for the token importance ratio
+  ripo_ratio_upper: 10.0
+
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 

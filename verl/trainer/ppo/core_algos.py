@@ -118,7 +118,9 @@ def _dump_prefix_clip_response_diagnostics(
                 torch.full_like(lengths, -1.0),
             )
 
-            masked_prefix_abs = torch.where(mask, prefix_avg_log_ratio.detach().abs(), torch.zeros_like(prefix_avg_log_ratio))
+            masked_prefix_abs = torch.where(
+                mask, prefix_avg_log_ratio.detach().abs(), torch.zeros_like(prefix_avg_log_ratio)
+            )
             masked_eps_pos = torch.where(mask, eps_pos.detach(), torch.zeros_like(eps_pos))
             masked_eps_neg = torch.where(mask, eps_neg.detach(), torch.zeros_like(eps_neg))
 
@@ -1563,6 +1565,124 @@ def compute_policy_loss_dppo_tv(
     return pg_loss, pg_metrics
 
 
+@register_policy_loss("ripo_clip")
+def compute_policy_loss_ripo_clip(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute the paper-exact Riemannian Isometric Policy Optimization loss.
+
+    RIPO replaces PPO's fixed ratio deviation with the probability-dependent
+    Riemannian Isometric Clip from Eq. 11 of the paper:
+
+        epsilon(pi_old(a|s)) = sqrt(delta / pi_old(a|s)).
+
+    The paper uses a symmetric ``delta=0.05`` by default and additionally
+    truncates token importance ratios to ``[0.5, 10]``. Its LLM objective uses
+    token-level ratios, group-relative advantages, and token-mean aggregation.
+    """
+
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+    if loss_agg_mode != "token-mean":
+        raise ValueError(f"RIPO requires paper token-mean aggregation, got {loss_agg_mode!r}.")
+
+    policy_loss_cfg = config.policy_loss
+    delta_low = float(policy_loss_cfg.get("ripo_delta_low", 0.05))
+    delta_high = float(policy_loss_cfg.get("ripo_delta_high", 0.05))
+    ratio_lower = float(policy_loss_cfg.get("ripo_ratio_lower", 0.5))
+    ratio_upper = float(policy_loss_cfg.get("ripo_ratio_upper", 10.0))
+    if delta_low <= 0.0 or delta_high <= 0.0:
+        raise ValueError("ripo_delta_low/high must both be positive.")
+    if not 0.0 < ratio_lower < 1.0 < ratio_upper:
+        raise ValueError("RIPO ratio bounds must satisfy 0 < lower < 1 < upper.")
+
+    log_ratio = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
+    raw_ratio = torch.exp(log_ratio)
+    ppo_kl = verl_F.masked_mean(-log_ratio, response_mask)
+
+    # Compute the action probability and Riemannian radius in float32. This
+    # avoids BF16 underflow for rare tokens; the paper's finite ratio bounds
+    # then keep the effective clipping interval well-conditioned.
+    old_prob = torch.exp(old_log_prob.detach().float()).clamp_min(torch.finfo(torch.float32).tiny)
+    epsilon_low = torch.sqrt(delta_low / old_prob)
+    epsilon_high = torch.sqrt(delta_high / old_prob)
+    dynamic_lower = 1.0 - epsilon_low
+    dynamic_upper = 1.0 + epsilon_high
+    effective_lower = torch.maximum(dynamic_lower, torch.full_like(dynamic_lower, ratio_lower))
+    effective_upper = torch.minimum(dynamic_upper, torch.full_like(dynamic_upper, ratio_upper))
+
+    # The paper applies dual-sided truncation [0.5, 10] to the token IS ratio,
+    # followed by the probability-dependent Riemannian clipping interval.
+    truncated_ratio = torch.clamp(raw_ratio, min=ratio_lower, max=ratio_upper)
+    clipped_ratio = torch.minimum(torch.maximum(truncated_ratio, effective_lower), effective_upper)
+
+    pg_losses_unclipped = -advantages * truncated_ratio
+    pg_losses_clipped = -advantages * clipped_ratio
+    pg_losses = torch.maximum(pg_losses_unclipped, pg_losses_clipped)
+
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=response_mask,
+        loss_agg_mode="token-mean",
+        **config.global_batch_info,
+    )
+
+    ratio_lower_clipped = raw_ratio < ratio_lower
+    ratio_upper_clipped = raw_ratio > ratio_upper
+    dynamic_lower_clipped = truncated_ratio < effective_lower
+    dynamic_upper_clipped = truncated_ratio > effective_upper
+    lower_clipped = ratio_lower_clipped | dynamic_lower_clipped
+    upper_clipped = ratio_upper_clipped | dynamic_upper_clipped
+    clipped = lower_clipped | upper_clipped
+
+    pg_clipfrac = verl_F.masked_mean(clipped.float(), response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean(lower_clipped.float(), response_mask)
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+        "actor/ripo_clip/delta_low": delta_low,
+        "actor/ripo_clip/delta_high": delta_high,
+        "actor/ripo_clip/ratio_lower": ratio_lower,
+        "actor/ripo_clip/ratio_upper": ratio_upper,
+        "actor/ripo_clip/old_action_prob_mean": verl_F.masked_mean(old_prob, response_mask).detach().item(),
+        "actor/ripo_clip/epsilon_low_mean": verl_F.masked_mean(epsilon_low, response_mask).detach().item(),
+        "actor/ripo_clip/epsilon_high_mean": verl_F.masked_mean(epsilon_high, response_mask).detach().item(),
+        "actor/ripo_clip/lower_bound_mean": verl_F.masked_mean(effective_lower, response_mask).detach().item(),
+        "actor/ripo_clip/upper_bound_mean": verl_F.masked_mean(effective_upper, response_mask).detach().item(),
+        "actor/ripo_clip/ratio_lower_clipfrac": verl_F.masked_mean(
+            ratio_lower_clipped.float(), response_mask
+        )
+        .detach()
+        .item(),
+        "actor/ripo_clip/ratio_upper_clipfrac": verl_F.masked_mean(
+            ratio_upper_clipped.float(), response_mask
+        )
+        .detach()
+        .item(),
+        "actor/ripo_clip/dynamic_lower_clipfrac": verl_F.masked_mean(
+            dynamic_lower_clipped.float(), response_mask
+        )
+        .detach()
+        .item(),
+        "actor/ripo_clip/dynamic_upper_clipfrac": verl_F.masked_mean(
+            dynamic_upper_clipped.float(), response_mask
+        )
+        .detach()
+        .item(),
+    }
+    return pg_loss, pg_metrics
+
+
 @register_policy_loss("dppo_kl")
 def compute_policy_loss_dppo_kl(
     old_log_prob: torch.Tensor,
@@ -2297,9 +2417,11 @@ def _compute_policy_loss_prefix_exact_kl_clip(
     rollout_is_weights: torch.Tensor | None = None,
     *,
     probability_weighted: bool,
+    geometric_average_surrogate: bool,
+    dual_clip_negative_advantage: bool,
     loss_name: str,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Geometric-average-prefix surrogate with exact cumulative-prefix clipping.
+    """Prefix surrogate with exact cumulative-prefix clipping.
 
     The unweighted strategy applies
 
@@ -2310,12 +2432,15 @@ def _compute_policy_loss_prefix_exact_kl_clip(
         R - 1 - log(R) <= t * delta / pi_old(prefix).
 
     where ``R = exp(sum_{k<=t} log r_k)`` is the cumulative prefix likelihood
-    ratio. Separate low/high deltas define the two roots. Dividing the solved
-    cumulative log bounds by ``t`` gives exactly equivalent bounds for the
-    geometric-average prefix ratio ``R ** (1 / t)`` used by the surrogate.
+    ratio. Separate low/high deltas define the two roots. The surrogate may
+    use either the cumulative prefix ratio directly or its geometric average;
+    both use the same exact cumulative-prefix clipping decisions.
 
-    The geometric-average prefix ratio is detached and gradients flow only
-    through the current-token log probability.
+    The prefix ratio value is detached and gradients flow only through the
+    current-token log probability. The optional negative-advantage dual clip
+    places a lower bound on the maximized surrogate (an upper bound on the
+    minimized loss), preventing ``A < 0, R_prefix >> 1`` from selecting the
+    unbounded raw PPO branch.
     """
 
     assert config is not None
@@ -2348,17 +2473,20 @@ def _compute_policy_loss_prefix_exact_kl_clip(
 
     lower_avg_log_bound = lower_log_bound / prefix_len
     upper_avg_log_bound = upper_log_bound / prefix_len
-    prefix_avg_log_ratio_clip = torch.minimum(
-        torch.maximum(prefix_avg_log_ratio, lower_avg_log_bound), upper_avg_log_bound
+    surrogate_log_ratio = prefix_avg_log_ratio if geometric_average_surrogate else prefix_log_ratio_sum
+    surrogate_lower_log_bound = lower_avg_log_bound if geometric_average_surrogate else lower_log_bound
+    surrogate_upper_log_bound = upper_avg_log_bound if geometric_average_surrogate else upper_log_bound
+    surrogate_log_ratio_clip = torch.minimum(
+        torch.maximum(surrogate_log_ratio, surrogate_lower_log_bound), surrogate_upper_log_bound
     )
 
     # The detached average-prefix term supplies the numerical importance
     # weight R_pre ** (1 / t). The zero-valued log_prob - log_prob.detach()
     # term preserves the existing current-token-only gradient route.
-    prefix_log_importance_ratio = log_prob - log_prob.detach() + prefix_avg_log_ratio.detach()
+    prefix_log_importance_ratio = log_prob - log_prob.detach() + surrogate_log_ratio.detach()
     prefix_log_importance_ratio = torch.clamp(prefix_log_importance_ratio, min=-10.0, max=10.0)
     prefix_log_importance_ratio_clip = torch.minimum(
-        torch.maximum(prefix_log_importance_ratio, lower_avg_log_bound), upper_avg_log_bound
+        torch.maximum(prefix_log_importance_ratio, surrogate_lower_log_bound), surrogate_upper_log_bound
     )
     prefix_log_importance_ratio_clip = torch.clamp(prefix_log_importance_ratio_clip, min=-10.0, max=10.0)
 
@@ -2367,6 +2495,14 @@ def _compute_policy_loss_prefix_exact_kl_clip(
     pg_losses1 = -advantages * ratio_for_loss
     pg_losses2 = -advantages * ratio_clip_for_loss
     pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    dual_clipped = torch.zeros_like(response_mask, dtype=torch.bool)
+    if dual_clip_negative_advantage:
+        dual_log_cap = torch.clamp(surrogate_upper_log_bound, min=-10.0, max=10.0)
+        dual_ratio_cap = torch.exp(dual_log_cap)
+        dual_loss_cap = -advantages * dual_ratio_cap
+        dual_clipped = (advantages < 0) & (ratio_for_loss > dual_ratio_cap)
+        pg_losses = torch.where(advantages < 0, torch.minimum(pg_losses, dual_loss_cap), pg_losses)
 
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
@@ -2378,8 +2514,8 @@ def _compute_policy_loss_prefix_exact_kl_clip(
         **config.global_batch_info,
     )
 
-    clipped = torch.ne(prefix_avg_log_ratio, prefix_avg_log_ratio_clip)
-    lower_clipped = clipped & (prefix_avg_log_ratio < lower_avg_log_bound)
+    clipped = torch.ne(surrogate_log_ratio, surrogate_log_ratio_clip)
+    lower_clipped = clipped & (surrogate_log_ratio < surrogate_lower_log_bound)
     pg_clipfrac = verl_F.masked_mean(clipped.float(), response_mask)
     pg_clipfrac_lower = verl_F.masked_mean(lower_clipped.float(), response_mask)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
@@ -2405,6 +2541,12 @@ def _compute_policy_loss_prefix_exact_kl_clip(
         * finite_lower_float
         * response_mask_float
     ).sum() / finite_lower_count
+    valid_raw_ratios = ratio_for_loss.detach()[response_mask.bool()].float()
+    raw_ratio_p95 = (
+        torch.quantile(valid_raw_ratios, 0.95)
+        if valid_raw_ratios.numel()
+        else torch.zeros((), device=ratio_for_loss.device)
+    )
 
     metric_prefix = f"actor/{loss_name}"
     pg_metrics = {
@@ -2414,7 +2556,19 @@ def _compute_policy_loss_prefix_exact_kl_clip(
         f"{metric_prefix}/delta_low": delta_low,
         f"{metric_prefix}/delta_high": delta_high,
         f"{metric_prefix}/probability_weighted": float(probability_weighted),
-        f"{metric_prefix}/geometric_average_surrogate": 1.0,
+        f"{metric_prefix}/geometric_average_surrogate": float(geometric_average_surrogate),
+        f"{metric_prefix}/cumulative_surrogate": float(not geometric_average_surrogate),
+        f"{metric_prefix}/dual_clip_negative_advantage": float(dual_clip_negative_advantage),
+        f"{metric_prefix}/dual_clipfrac": verl_F.masked_mean(
+            dual_clipped.float(), response_mask
+        ).detach().item(),
+        f"{metric_prefix}/raw_ratio_mean": verl_F.masked_mean(
+            ratio_for_loss.detach(), response_mask
+        ).item(),
+        f"{metric_prefix}/raw_ratio_p95": raw_ratio_p95.item(),
+        f"{metric_prefix}/raw_ratio_max": torch.where(
+            response_mask.bool(), ratio_for_loss.detach(), torch.zeros_like(ratio_for_loss)
+        ).max().item(),
         f"{metric_prefix}/avg_log_ratio_abs_mean": verl_F.masked_mean(
             prefix_avg_log_ratio.detach().abs(), response_mask
         ).item(),
@@ -2489,6 +2643,8 @@ def compute_policy_loss_prefix_probability_weighted_exact_kl_clip(
         config=config,
         rollout_is_weights=rollout_is_weights,
         probability_weighted=True,
+        geometric_average_surrogate=True,
+        dual_clip_negative_advantage=False,
         loss_name="prefix_probability_weighted_exact_kl_clip",
     )
 
@@ -2514,7 +2670,36 @@ def compute_policy_loss_prefix_exact_kl_clip(
         config=config,
         rollout_is_weights=rollout_is_weights,
         probability_weighted=False,
+        geometric_average_surrogate=True,
+        dual_clip_negative_advantage=False,
         loss_name="prefix_exact_kl_clip",
+    )
+
+
+@register_policy_loss("prefix_exact_kl_cumulative_dual_clip")
+def compute_policy_loss_prefix_exact_kl_cumulative_dual_clip(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Cumulative exact-prefix surrogate with negative-advantage dual clip."""
+
+    return _compute_policy_loss_prefix_exact_kl_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_is_weights=rollout_is_weights,
+        probability_weighted=False,
+        geometric_average_surrogate=False,
+        dual_clip_negative_advantage=True,
+        loss_name="prefix_exact_kl_cumulative_dual_clip",
     )
 
 
@@ -2786,7 +2971,9 @@ def compute_policy_loss_prefix_sum_dynamic_clip(
     # branch keeps clamp's zero-gradient behavior outside the active interval.
     prefix_log_importance_ratio = log_prob - log_prob.detach() + prefix_sum_log_ratio.detach()
     prefix_log_importance_ratio = torch.clamp(prefix_log_importance_ratio, min=-alpha, max=alpha)
-    prefix_log_importance_ratio_clip = torch.minimum(torch.maximum(prefix_log_importance_ratio, -sum_eps_neg), sum_eps_pos)
+    prefix_log_importance_ratio_clip = torch.minimum(
+        torch.maximum(prefix_log_importance_ratio, -sum_eps_neg), sum_eps_pos
+    )
 
     ratio_for_loss = torch.exp(prefix_log_importance_ratio)
     ratio_clip_for_loss = torch.exp(prefix_log_importance_ratio_clip)
@@ -3015,7 +3202,9 @@ def compute_policy_loss_prefix_sum_gate_avg_clip(
     clipped = torch.ne(prefix_avg_log_ratio, prefix_avg_log_ratio_clip)
     sum_gate_clipped = torch.ne(sum_log_ratio_for_metrics, sum_log_ratio_clip_for_metrics)
     pg_clipfrac = verl_F.masked_mean(clipped.float(), response_mask)
-    pg_clipfrac_lower = verl_F.masked_mean((clipped & (prefix_avg_log_ratio < -gate_avg_eps_neg)).float(), response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean(
+        (clipped & (prefix_avg_log_ratio < -gate_avg_eps_neg)).float(), response_mask
+    )
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
 
     pg_metrics = {
