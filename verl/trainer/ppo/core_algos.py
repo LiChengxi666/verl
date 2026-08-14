@@ -2649,6 +2649,33 @@ def compute_policy_loss_prefix_probability_weighted_exact_kl_clip(
     )
 
 
+@register_policy_loss("prefix_probability_weighted_exact_kl_cumulative_dual_clip")
+def compute_policy_loss_prefix_probability_weighted_exact_kl_cumulative_dual_clip(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Probability-weighted exact bounds with cumulative-prefix surrogate and dual clip."""
+
+    return _compute_policy_loss_prefix_exact_kl_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_is_weights=rollout_is_weights,
+        probability_weighted=True,
+        geometric_average_surrogate=False,
+        dual_clip_negative_advantage=True,
+        loss_name="prefix_probability_weighted_exact_kl_cumulative_dual_clip",
+    )
+
+
 @register_policy_loss("prefix_exact_kl_clip")
 def compute_policy_loss_prefix_exact_kl_clip(
     old_log_prob: torch.Tensor,
