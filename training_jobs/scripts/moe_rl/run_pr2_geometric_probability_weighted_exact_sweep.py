@@ -21,17 +21,17 @@ CODE_ROOT = ROOT / "verl"
 VENDOR_DIR = CODE_ROOT / ".ray_vendor"
 SOURCE_RECIPE = Path(__file__).with_name("run_pr2_probability_weighted_exact_geom_dual_over01.py")
 LOSS_MODE = "prefix_geometric_probability_weighted_exact_kl_clip"
-SWEEP_GROUP = "pr2_geom_prefix_probability_exact_budget_sweep_20260818"
+SWEEP_GROUP = "pr2_geom_prefix_probability_exact_wide_budget_sweep_20260818"
 
-# The geometric old-prefix probability removes the exponential-in-position
-# scaling of the original full-prefix probability.  The sweep spans two
-# orders of magnitude around the scale inferred from the successful 0.5x run,
-# while keeping each upper budget at 4x its lower budget.
+# The first geometric-probability sweep clipped 42--49% of tokens even at its
+# widest setting.  Move the search region upward by full decades so this
+# sweep spans clearly active clipping through an effectively loose region.
+# Each upper budget remains 4x its lower budget.
 GROUPS = {
-    "d1e7_4e7": (1.0e-7, 4.0e-7),
-    "d5e7_2e6": (5.0e-7, 2.0e-6),
-    "d2e6_8e6": (2.0e-6, 8.0e-6),
-    "d1e5_4e5": (1.0e-5, 4.0e-5),
+    "d1e4_4e4": (1.0e-4, 4.0e-4),
+    "d1e3_4e3": (1.0e-3, 4.0e-3),
+    "d1e2_4e2": (1.0e-2, 4.0e-2),
+    "d1e1_4e1": (1.0e-1, 4.0e-1),
 }
 
 
@@ -48,10 +48,10 @@ def identities(group: str) -> tuple[str, str, str]:
     if group not in GROUPS:
         raise ValueError(f"unknown group {group!r}; choose one of {sorted(GROUPS)}")
     run_id = f"pr2_geomprob_exact_{group}_o2_over01"
-    state_slug = f"pr2_geomprob_exact_{group}_off2_over01_moe32_20260818"
+    state_slug = f"pr2_geomprob_exact_wide_{group}_off2_over01_moe32_20260818"
     hdfs_dir = (
         "hdfs://harunawl/home/byte_data_seed_wl/user/wu.hanlin/offpolicyrl/checkpoints/"
-        f"moe-pr2-geomprob-exact-{group}-off2-over01-r16384-4x8-20260818"
+        f"moe-pr2-geomprob-exact-wide-{group}-off2-over01-r16384-4x8-20260818"
     )
     return run_id, state_slug, hdfs_dir
 
