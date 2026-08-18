@@ -2420,6 +2420,7 @@ def _compute_policy_loss_prefix_exact_kl_clip(
     geometric_average_surrogate: bool,
     dual_clip_negative_advantage: bool,
     loss_name: str,
+    geometric_probability_weighted: bool = False,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Prefix surrogate with exact cumulative-prefix clipping.
 
@@ -2430,6 +2431,14 @@ def _compute_policy_loss_prefix_exact_kl_clip(
     The probability-weighted strategy instead applies
 
         R - 1 - log(R) <= t * delta / pi_old(prefix).
+
+    The geometric-probability-weighted strategy length-normalizes the old
+    prefix probability before applying the same coordinate constraint:
+
+        R - 1 - log(R) <= t * delta / pi_old(prefix) ** (1 / t).
+
+    This retains a per-token typicality correction without making the budget
+    grow exponentially with prefix length.
 
     where ``R = exp(sum_{k<=t} log r_k)`` is the cumulative prefix likelihood
     ratio. Separate low/high deltas define the two roots. The surrogate may
@@ -2451,6 +2460,8 @@ def _compute_policy_loss_prefix_exact_kl_clip(
     delta_high = float(policy_loss_cfg.get("prefix_exact_kl_delta_high", 5.17091807565e-3))
     if delta_low <= 0.0 or delta_high <= 0.0:
         raise ValueError("prefix_exact_kl_delta_low/high must both be positive.")
+    if probability_weighted and geometric_probability_weighted:
+        raise ValueError("full and geometric prefix-probability weighting are mutually exclusive.")
 
     negative_approx_kl = log_prob - old_log_prob
     log_ratio = negative_approx_kl * response_mask
@@ -2468,6 +2479,10 @@ def _compute_policy_loss_prefix_exact_kl_clip(
     if probability_weighted:
         log_budget_low = log_budget_low - old_prefix_log_prob
         log_budget_high = log_budget_high - old_prefix_log_prob
+    elif geometric_probability_weighted:
+        old_prefix_avg_log_prob = old_prefix_log_prob / prefix_len
+        log_budget_low = log_budget_low - old_prefix_avg_log_prob
+        log_budget_high = log_budget_high - old_prefix_avg_log_prob
     lower_log_bound, _ = _solve_exact_prefix_kl_log_bounds(log_budget_low)
     _, upper_log_bound = _solve_exact_prefix_kl_log_bounds(log_budget_high)
 
@@ -2556,6 +2571,7 @@ def _compute_policy_loss_prefix_exact_kl_clip(
         f"{metric_prefix}/delta_low": delta_low,
         f"{metric_prefix}/delta_high": delta_high,
         f"{metric_prefix}/probability_weighted": float(probability_weighted),
+        f"{metric_prefix}/geometric_probability_weighted": float(geometric_probability_weighted),
         f"{metric_prefix}/geometric_average_surrogate": float(geometric_average_surrogate),
         f"{metric_prefix}/cumulative_surrogate": float(not geometric_average_surrogate),
         f"{metric_prefix}/dual_clip_negative_advantage": float(dual_clip_negative_advantage),
@@ -2646,6 +2662,34 @@ def compute_policy_loss_prefix_probability_weighted_exact_kl_clip(
         geometric_average_surrogate=True,
         dual_clip_negative_advantage=False,
         loss_name="prefix_probability_weighted_exact_kl_clip",
+    )
+
+
+@register_policy_loss("prefix_geometric_probability_weighted_exact_kl_clip")
+def compute_policy_loss_prefix_geometric_probability_weighted_exact_kl_clip(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Exact-prefix clip weighted by geometric-mean old prefix probability."""
+
+    return _compute_policy_loss_prefix_exact_kl_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_is_weights=rollout_is_weights,
+        probability_weighted=False,
+        geometric_probability_weighted=True,
+        geometric_average_surrogate=True,
+        dual_clip_negative_advantage=False,
+        loss_name="prefix_geometric_probability_weighted_exact_kl_clip",
     )
 
 

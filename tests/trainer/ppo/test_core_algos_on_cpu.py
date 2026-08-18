@@ -26,6 +26,9 @@ from verl.trainer.ppo.core_algos import (
     compute_grpo_vectorized_outcome_advantage,
     compute_policy_loss_prefix_exact_kl_clip,
     compute_policy_loss_prefix_exact_kl_cumulative_dual_clip,
+    compute_policy_loss_prefix_geometric_probability_weighted_exact_kl_clip,
+    compute_policy_loss_prefix_probability_weighted_exact_kl_clip,
+    compute_policy_loss_prefix_probability_weighted_exact_kl_cumulative_dual_clip,
     compute_policy_loss_prefix_ripo_clip,
     compute_policy_loss_ripo_clip,
     compute_rloo_outcome_advantage,
@@ -325,6 +328,143 @@ def test_prefix_exact_kl_clip_preserves_cumulative_prefix_clip_decisions():
     exact_kl_coordinate = torch.exp(cumulative_log_ratio) - 1.0 - cumulative_log_ratio
     expected_clipped = exact_kl_coordinate > prefix_len * delta_high
     assert metrics["actor/pg_clipfrac"] == pytest.approx(expected_clipped.float().mean().item())
+
+
+def test_probability_weighted_exact_prefix_geometric_clip_uses_old_prefix_probability_and_local_gradient():
+    old_log_prob = torch.tensor([[-2.0, -2.0]])
+    token_log_ratio = torch.tensor([[0.2, 0.2]])
+    log_prob = (old_log_prob + token_log_ratio).requires_grad_(True)
+    response_mask = torch.ones_like(old_log_prob)
+    advantages = -torch.ones_like(old_log_prob)
+
+    config = ActorConfig(
+        strategy="fsdp",
+        rollout_n=1,
+        ppo_micro_batch_size=1,
+        policy_loss=PolicyLossConfig(
+            prefix_exact_kl_delta_low=100.0,
+            prefix_exact_kl_delta_high=100.0,
+        ),
+    )
+
+    loss, metrics = compute_policy_loss_prefix_probability_weighted_exact_kl_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        config=config,
+    )
+
+    assert metrics["actor/prefix_probability_weighted_exact_kl_clip/probability_weighted"] == 1.0
+    assert metrics["actor/prefix_probability_weighted_exact_kl_clip/geometric_average_surrogate"] == 1.0
+    loss.backward()
+    geometric_prefix_ratio = torch.exp(torch.cumsum(token_log_ratio, dim=-1) / torch.arange(1, 3))
+    assert torch.allclose(log_prob.grad, geometric_prefix_ratio / 2.0, atol=1e-6)
+
+
+def test_geometric_probability_weighted_exact_prefix_uses_length_normalized_old_probability():
+    old_log_prob = torch.tensor([[-2.0, -2.0]])
+    token_log_ratio = torch.tensor([[0.2, 0.3]])
+    log_prob = old_log_prob + token_log_ratio
+    response_mask = torch.ones_like(old_log_prob)
+    advantages = torch.ones_like(old_log_prob)
+    delta = 5e-3
+
+    config = ActorConfig(
+        strategy="fsdp",
+        rollout_n=1,
+        ppo_micro_batch_size=1,
+        policy_loss=PolicyLossConfig(
+            prefix_exact_kl_delta_low=delta,
+            prefix_exact_kl_delta_high=delta,
+        ),
+    )
+
+    _, metrics = compute_policy_loss_prefix_geometric_probability_weighted_exact_kl_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        config=config,
+    )
+
+    # The average old log probability is -2 at both positions. The first
+    # prefix remains inside delta * exp(2), while the second exceeds
+    # 2 * delta * exp(2). Full-prefix weighting would instead use exp(4) at
+    # the second position and would not clip it.
+    assert metrics["actor/pg_clipfrac"] == pytest.approx(0.5)
+    prefix = "actor/prefix_geometric_probability_weighted_exact_kl_clip"
+    assert metrics[f"{prefix}/probability_weighted"] == 0.0
+    assert metrics[f"{prefix}/geometric_probability_weighted"] == 1.0
+    assert metrics[f"{prefix}/geometric_average_surrogate"] == 1.0
+    assert get_policy_loss_fn("prefix_geometric_probability_weighted_exact_kl_clip") is (
+        compute_policy_loss_prefix_geometric_probability_weighted_exact_kl_clip
+    )
+
+
+def test_probability_weighted_exact_prefix_cumulative_dual_uses_raw_prefix_ratio():
+    old_log_prob = torch.tensor([[-2.0, -2.0]])
+    token_log_ratio = torch.log(torch.tensor([[2.0, 2.0]]))
+    log_prob = (old_log_prob + token_log_ratio).requires_grad_(True)
+    response_mask = torch.ones_like(old_log_prob)
+    advantages = torch.ones_like(old_log_prob)
+
+    config = ActorConfig(
+        strategy="fsdp",
+        rollout_n=1,
+        ppo_micro_batch_size=1,
+        policy_loss=PolicyLossConfig(
+            prefix_exact_kl_delta_low=100.0,
+            prefix_exact_kl_delta_high=100.0,
+        ),
+    )
+
+    loss, metrics = compute_policy_loss_prefix_probability_weighted_exact_kl_cumulative_dual_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        config=config,
+    )
+
+    assert loss.item() == pytest.approx(-3.0)
+    prefix = "actor/prefix_probability_weighted_exact_kl_cumulative_dual_clip"
+    assert metrics[f"{prefix}/probability_weighted"] == 1.0
+    assert metrics[f"{prefix}/geometric_average_surrogate"] == 0.0
+    assert metrics[f"{prefix}/cumulative_surrogate"] == 1.0
+    assert metrics[f"{prefix}/dual_clip_negative_advantage"] == 1.0
+    loss.backward()
+    assert torch.allclose(log_prob.grad, torch.tensor([[-1.0, -2.0]]), atol=1e-6)
+
+
+def test_probability_weighted_exact_prefix_cumulative_dual_caps_negative_advantage():
+    old_log_prob = torch.zeros((2, 1))
+    log_prob = torch.full((2, 1), np.log(4.0), requires_grad=True)
+    response_mask = torch.ones_like(old_log_prob)
+    advantages = torch.tensor([[-1.0], [1.0]])
+    delta_high = 1.0 - np.log(2.0)
+
+    config = ActorConfig(
+        strategy="fsdp",
+        rollout_n=1,
+        ppo_micro_batch_size=1,
+        policy_loss=PolicyLossConfig(
+            prefix_exact_kl_delta_low=100.0,
+            prefix_exact_kl_delta_high=delta_high,
+        ),
+    )
+
+    loss, metrics = compute_policy_loss_prefix_probability_weighted_exact_kl_cumulative_dual_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        config=config,
+    )
+
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)
+    prefix = "actor/prefix_probability_weighted_exact_kl_cumulative_dual_clip"
+    assert metrics[f"{prefix}/dual_clipfrac"] == pytest.approx(0.5)
 
 
 class TestRegisterAdvEst(unittest.TestCase):
