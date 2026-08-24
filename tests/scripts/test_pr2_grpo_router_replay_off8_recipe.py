@@ -109,3 +109,27 @@ def test_grpo_router_replay_off8_matches_pr2_recipe(mode, router_mode, rollout_r
     )
     assert "nokl" in run_id
     assert "-nokl-" in hdfs_dir
+
+
+def test_existing_hdfs_requires_explicit_complete_checkpoint_resume():
+    recipe = _load_recipe()
+    root = "hdfs://example/checkpoints/run"
+    existing = {root, f"{root}/global_step_5/_SUCCESS"}
+
+    def exists(path):
+        return path in existing
+
+    def read_text(path):
+        assert path == f"{root}/latest_checkpointed_iteration.txt"
+        return "5\n"
+
+    with pytest.raises(RuntimeError, match="Refusing to reuse"):
+        recipe.validate_hdfs_target(root, allow_resume=False, exists=exists, read_text=read_text)
+
+    assert recipe.validate_hdfs_target(
+        root, allow_resume=True, exists=exists, read_text=read_text
+    ) == 5
+
+    existing.remove(f"{root}/global_step_5/_SUCCESS")
+    with pytest.raises(RuntimeError, match="incomplete checkpoint"):
+        recipe.validate_hdfs_target(root, allow_resume=True, exists=exists, read_text=read_text)

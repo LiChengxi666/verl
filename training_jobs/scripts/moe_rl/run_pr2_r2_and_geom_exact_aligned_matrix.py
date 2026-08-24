@@ -64,6 +64,44 @@ def identities(mode: str) -> tuple[str, str, str]:
     return run_id, state_slug, hdfs_dir
 
 
+def _hdfs_exists(path: str) -> bool:
+    return (
+        subprocess.run(
+            ["hdfs", "dfs", "-test", "-e", path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
+    )
+
+
+def _hdfs_read_text(path: str) -> str:
+    return subprocess.run(
+        ["hdfs", "dfs", "-cat", path],
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout
+
+
+def validate_hdfs_target(hdfs_dir: str, *, allow_resume: bool, exists=None, read_text=None) -> int | None:
+    exists = exists or _hdfs_exists
+    read_text = read_text or _hdfs_read_text
+    if not exists(hdfs_dir):
+        return None
+    if not allow_resume:
+        raise RuntimeError(f"Refusing to reuse existing HDFS path: {hdfs_dir}")
+    latest_path = f"{hdfs_dir}/latest_checkpointed_iteration.txt"
+    try:
+        latest_step = int(read_text(latest_path).strip())
+    except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+        raise RuntimeError(f"Invalid HDFS resume marker: {latest_path}") from exc
+    success_path = f"{hdfs_dir}/global_step_{latest_step}/_SUCCESS"
+    if latest_step <= 0 or not exists(success_path):
+        raise RuntimeError(f"Refusing incomplete checkpoint at {success_path}")
+    return latest_step
+
+
 def configure(base: dict, mode: str, *, state_root: Path, source) -> dict:
     setting = SETTINGS[mode]
     run_id, _, hdfs_dir = identities(mode)
@@ -130,10 +168,12 @@ def main() -> None:
             [sys.executable, str(Path(__file__).with_name("common") / "check_r3_vllm.py")],
             check=True,
         )
-    if subprocess.run(
-        ["hdfs", "dfs", "-test", "-e", hdfs_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-    ).returncode == 0:
-        raise RuntimeError(f"Refusing to reuse existing HDFS path: {hdfs_dir}")
+    resume_step = validate_hdfs_target(
+        hdfs_dir,
+        allow_resume=os.environ.get("ALLOW_EXISTING_HDFS_RESUME") == "1",
+    )
+    if resume_step is not None:
+        print(f"Validated complete HDFS checkpoint for resume: step {resume_step}", flush=True)
 
     actor = payload["actor_rollout_ref"]["actor"]
     rollout = payload["actor_rollout_ref"]["rollout"]
