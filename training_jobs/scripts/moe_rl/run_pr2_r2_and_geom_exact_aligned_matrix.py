@@ -49,15 +49,17 @@ def identities(mode: str) -> tuple[str, str, str]:
         "r2_off2": "PR2_GSPO_R2_off2_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr2e-6_300",
         "geom_off4": "PR2_geomprob_exact_d5e4_2e3_off4_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr1p5e-6_300",
         "geom_off8": "PR2_geomprob_exact_d5e4_2e3_off8_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr1e-6_300",
-        "grpo_r2_off8": "PR2_GRPO_R2_off8_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr1e-6_clip0p2_0p28_300",
-        "grpo_r3_off8": "PR2_GRPO_R3_off8_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr1e-6_clip0p2_0p28_300",
+        "grpo_r2_off8": "PR2_GRPO_R2_off8_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr1e-6_clip0p2_0p28_nokl_300",
+        "grpo_r3_off8": "PR2_GRPO_R3_off8_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr1e-6_clip0p2_0p28_nokl_300",
     }
     run_id = names[mode]
     date_slug = "20260824" if mode.startswith("grpo_r") else "20260820"
-    state_slug = f"{mode}_aligned_moe32_{date_slug}"
+    nokl_slug = "_nokl" if mode.startswith("grpo_r") else ""
+    state_slug = f"{mode}_aligned{nokl_slug}_moe32_{date_slug}"
+    alignment_slug = "aligned-nokl-over01" if mode.startswith("grpo_r") else "aligned-over01"
     hdfs_dir = (
         "hdfs://harunawl/home/byte_data_seed_wl/user/wu.hanlin/offpolicyrl/checkpoints/"
-        f"moe-{mode.replace('_', '-')}-aligned-over01-r16384-4x8-{date_slug}"
+        f"moe-{mode.replace('_', '-')}-{alignment_slug}-r16384-4x8-{date_slug}"
     )
     return run_id, state_slug, hdfs_dir
 
@@ -87,6 +89,8 @@ def configure(base: dict, mode: str, *, state_root: Path, source) -> dict:
     is_grpo_router_replay = mode.startswith("grpo_r")
     if is_grpo_router_replay:
         actor["loss_agg_mode"] = "token-mean"
+        actor["use_kl_loss"] = False
+        actor["kl_loss_coef"] = 0.0
         actor["clip_ratio"] = 0.2
         actor["clip_ratio_low"] = 0.2
         actor["clip_ratio_high"] = 0.28
@@ -143,6 +147,7 @@ def main() -> None:
     assert rollout["enable_rollout_routing_replay"] is (mode == "grpo_r3_off8")
     if mode.startswith("grpo_r"):
         assert actor["loss_agg_mode"] == "token-mean"
+        assert actor["use_kl_loss"] is False and actor["kl_loss_coef"] == 0.0
         assert actor["clip_ratio"] == actor["clip_ratio_low"] == 0.2
         assert actor["clip_ratio_high"] == 0.28
     else:

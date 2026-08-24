@@ -39,6 +39,8 @@ def _base_config():
                 "policy_loss": {"loss_mode": "gspo"},
                 "megatron": {"router_replay": {"mode": "disabled"}},
                 "loss_agg_mode": "seq-mean-token-mean",
+                "use_kl_loss": True,
+                "kl_loss_coef": 1.0e-3,
                 "clip_ratio": 0.2,
                 "clip_ratio_low": 0.2,
                 "clip_ratio_high": 0.2,
@@ -77,6 +79,7 @@ def _base_config():
 )
 def test_grpo_router_replay_off8_matches_pr2_recipe(mode, router_mode, rollout_replay, tmp_path):
     recipe = _load_recipe()
+    run_id, _, hdfs_dir = recipe.identities(mode)
     payload = recipe.configure(_base_config(), mode, state_root=tmp_path, source=_Source())
 
     actor = payload["actor_rollout_ref"]["actor"]
@@ -88,6 +91,8 @@ def test_grpo_router_replay_off8_matches_pr2_recipe(mode, router_mode, rollout_r
     assert actor["optim"]["lr"] == 1.0e-6
     assert actor["policy_loss"]["loss_mode"] == "vanilla"
     assert actor["loss_agg_mode"] == "token-mean"
+    assert actor["use_kl_loss"] is False
+    assert actor["kl_loss_coef"] == 0.0
     assert actor["clip_ratio"] == 0.2
     assert actor["clip_ratio_low"] == 0.2
     assert actor["clip_ratio_high"] == 0.28
@@ -102,3 +107,5 @@ def test_grpo_router_replay_off8_matches_pr2_recipe(mode, router_mode, rollout_r
     assert payload["ray_kwargs"]["ray_init"]["runtime_env"]["env_vars"]["WANDB_RUN_GROUP"] == (
         "PR2_off8_method_comparison_over01"
     )
+    assert "nokl" in run_id
+    assert "-nokl-" in hdfs_dir
