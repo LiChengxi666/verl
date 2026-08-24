@@ -20,6 +20,7 @@ ROOT = Path(os.environ.get("OFFPOLICYRL_ROOT", "/opt/tiger/offpolicyrl"))
 SOURCE_RECIPE = Path(__file__).with_name("run_pr2_geometric_probability_weighted_exact_sweep.py")
 PROJECT = "verl_moe_router_replay"
 WANDB_GROUP = "pr2_r2_and_geomprob_exact_offpolicy_matrix_20260820"
+GRPO_OFF8_WANDB_GROUP = "PR2_off8_method_comparison_over01"
 LOSS_MODE = "prefix_geometric_probability_weighted_exact_kl_clip"
 DELTA_LOW = 5.0e-4
 DELTA_HIGH = 2.0e-3
@@ -27,6 +28,8 @@ SETTINGS = {
     "r2_off2": {"mini_batch": 32, "lr": 2.0e-6, "loss": "gspo", "router_replay": "R2"},
     "geom_off4": {"mini_batch": 16, "lr": 1.5e-6, "loss": LOSS_MODE, "router_replay": "disabled"},
     "geom_off8": {"mini_batch": 8, "lr": 1.0e-6, "loss": LOSS_MODE, "router_replay": "disabled"},
+    "grpo_r2_off8": {"mini_batch": 8, "lr": 1.0e-6, "loss": "vanilla", "router_replay": "R2"},
+    "grpo_r3_off8": {"mini_batch": 8, "lr": 1.0e-6, "loss": "vanilla", "router_replay": "R3"},
 }
 
 
@@ -46,12 +49,15 @@ def identities(mode: str) -> tuple[str, str, str]:
         "r2_off2": "PR2_GSPO_R2_off2_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr2e-6_300",
         "geom_off4": "PR2_geomprob_exact_d5e4_2e3_off4_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr1p5e-6_300",
         "geom_off8": "PR2_geomprob_exact_d5e4_2e3_off8_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr1e-6_300",
+        "grpo_r2_off8": "PR2_GRPO_R2_off8_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr1e-6_clip0p2_0p28_300",
+        "grpo_r3_off8": "PR2_GRPO_R3_off8_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr1e-6_clip0p2_0p28_300",
     }
     run_id = names[mode]
-    state_slug = f"{mode}_aligned_moe32_20260820"
+    date_slug = "20260824" if mode.startswith("grpo_r") else "20260820"
+    state_slug = f"{mode}_aligned_moe32_{date_slug}"
     hdfs_dir = (
         "hdfs://harunawl/home/byte_data_seed_wl/user/wu.hanlin/offpolicyrl/checkpoints/"
-        f"moe-{mode.replace('_', '-')}-aligned-over01-r16384-4x8-20260820"
+        f"moe-{mode.replace('_', '-')}-aligned-over01-r16384-4x8-{date_slug}"
     )
     return run_id, state_slug, hdfs_dir
 
@@ -78,7 +84,18 @@ def configure(base: dict, mode: str, *, state_root: Path, source) -> dict:
     actor["policy_loss"]["prefix_exact_kl_delta_low"] = DELTA_LOW
     actor["policy_loss"]["prefix_exact_kl_delta_high"] = DELTA_HIGH
     actor["megatron"]["router_replay"]["mode"] = setting["router_replay"]
-    payload["actor_rollout_ref"]["rollout"]["enable_rollout_routing_replay"] = False
+    is_grpo_router_replay = mode.startswith("grpo_r")
+    if is_grpo_router_replay:
+        actor["loss_agg_mode"] = "token-mean"
+        actor["clip_ratio"] = 0.2
+        actor["clip_ratio_low"] = 0.2
+        actor["clip_ratio_high"] = 0.28
+    rollout = payload["actor_rollout_ref"]["rollout"]
+    rollout["enable_rollout_routing_replay"] = mode == "grpo_r3_off8"
+    if is_grpo_router_replay:
+        payload["ray_kwargs"]["ray_init"]["runtime_env"]["env_vars"]["WANDB_RUN_GROUP"] = (
+            GRPO_OFF8_WANDB_GROUP
+        )
     return payload
 
 
@@ -101,8 +118,14 @@ def main() -> None:
     source._load_source_recipe().load_environment(state, run_id)
     sys.path.insert(0, str(source.VENDOR_DIR))
     os.environ["PYTHONPATH"] = f"{source.VENDOR_DIR}:{source.CODE_ROOT}"
-    os.environ["WANDB_RUN_GROUP"] = WANDB_GROUP
+    wandb_group = GRPO_OFF8_WANDB_GROUP if mode.startswith("grpo_r") else WANDB_GROUP
+    os.environ["WANDB_RUN_GROUP"] = wandb_group
     source._load_source_recipe().require_official_wandb()
+    if mode == "grpo_r3_off8":
+        subprocess.run(
+            [sys.executable, str(Path(__file__).with_name("common") / "check_r3_vllm.py")],
+            check=True,
+        )
     if subprocess.run(
         ["hdfs", "dfs", "-test", "-e", hdfs_dir], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     ).returncode == 0:
@@ -117,8 +140,13 @@ def main() -> None:
     assert actor["optim"]["lr"] == setting["lr"]
     assert actor["policy_loss"]["loss_mode"] == setting["loss"]
     assert actor["megatron"]["router_replay"]["mode"] == setting["router_replay"]
-    assert rollout["enable_rollout_routing_replay"] is False
-    assert actor["loss_agg_mode"] == "seq-mean-token-mean"
+    assert rollout["enable_rollout_routing_replay"] is (mode == "grpo_r3_off8")
+    if mode.startswith("grpo_r"):
+        assert actor["loss_agg_mode"] == "token-mean"
+        assert actor["clip_ratio"] == actor["clip_ratio_low"] == 0.2
+        assert actor["clip_ratio_high"] == 0.28
+    else:
+        assert actor["loss_agg_mode"] == "seq-mean-token-mean"
     assert rollout["over_sample_rate"] == 0.1 and rollout["n"] == 8
     assert trainer["project_name"] == PROJECT
     assert trainer["test_freq"] == 5 and trainer["save_freq"] == 5
@@ -127,7 +155,7 @@ def main() -> None:
     assert len(payload["data"]["val_files"]) == 4
     print(
         "PR2_R2_GEOM_EXACT_MATRIX_CONFIG_AUDIT",
-        f"mode={mode}", f"run_id={run_id}", f"wandb_group={WANDB_GROUP}",
+        f"mode={mode}", f"run_id={run_id}", f"wandb_group={wandb_group}",
         f"loss={setting['loss']}", f"router_replay={setting['router_replay']}",
         f"mini_batch={setting['mini_batch']}", f"lr={setting['lr']}",
         f"delta_low={DELTA_LOW}", f"delta_high={DELTA_HIGH}",
