@@ -23,15 +23,15 @@ SOURCE_RECIPE = Path(__file__).with_name("run_pr2_probability_weighted_exact_geo
 LOSS_MODE = "prefix_geometric_probability_weighted_exact_kl_clip"
 SWEEP_GROUP = "pr2_geom_prefix_probability_exact_wide_budget_sweep_20260818"
 
-# The first geometric-probability sweep clipped 42--49% of tokens even at its
-# widest setting.  Move the search region upward by full decades so this
-# sweep spans clearly active clipping through an effectively loose region.
-# Each upper budget remains 4x its lower budget.
+# The first geometric-probability sweep clipped 42--49% of tokens.  The first
+# wide-budget follow-up established useful anchors at 1e-4 and 1e-3, while
+# 1e-2 and 1e-1 were effectively unclipped.  Replace those two loose points
+# with geometric midpoints; each upper budget remains 4x its lower budget.
 GROUPS = {
     "d1e4_4e4": (1.0e-4, 4.0e-4),
+    "d5e4_2e3": (5.0e-4, 2.0e-3),
     "d1e3_4e3": (1.0e-3, 4.0e-3),
-    "d1e2_4e2": (1.0e-2, 4.0e-2),
-    "d1e1_4e1": (1.0e-1, 4.0e-1),
+    "d5e3_2e2": (5.0e-3, 2.0e-2),
 }
 
 
