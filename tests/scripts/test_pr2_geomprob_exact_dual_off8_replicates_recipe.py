@@ -69,3 +69,13 @@ def test_recipe_rejects_unplanned_seed():
 
     with pytest.raises(ValueError, match="seed must be one of"):
         recipe.configure_dual_clip_replica(_payload(), 45)
+
+
+def test_runtime_recipe_dependency_chain_is_loadable():
+    recipe = _load_recipe()
+    matrix = recipe._load(recipe.MATRIX_RECIPE, "matrix_dependency")
+    sweep = matrix._load_source_recipe()
+
+    base_recipe = sweep._load_source_recipe()
+
+    assert base_recipe.BASE_CONFIG.name == "PR2_CTPO_off2_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_300.json"
