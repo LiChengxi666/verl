@@ -18,7 +18,7 @@ def _load_recipe():
 
 def _payload():
     return {
-        "data": {"seed": 42},
+        "data": {},
         "actor_rollout_ref": {
             "actor": {
                 "data_loader_seed": 42,
@@ -69,6 +69,23 @@ def test_recipe_rejects_unplanned_seed():
 
     with pytest.raises(ValueError, match="seed must be one of"):
         recipe.configure_dual_clip_replica(_payload(), 45)
+
+
+def test_reference_replica_audit_accepts_missing_data_seed():
+    recipe = _load_recipe()
+    payload = _payload()
+    recipe.configure_dual_clip_replica(payload, 42)
+
+    recipe.validate_replica_seed_fields(payload, 42, recipe.MISSING_DATA_SEED)
+
+
+@pytest.mark.parametrize("seed", [43, 44])
+def test_seeded_replica_audit_requires_all_existing_seed_fields(seed):
+    recipe = _load_recipe()
+    payload = _payload()
+    recipe.configure_dual_clip_replica(payload, seed)
+
+    recipe.validate_replica_seed_fields(payload, seed, recipe.MISSING_DATA_SEED)
 
 
 def test_runtime_recipe_dependency_chain_is_loadable():

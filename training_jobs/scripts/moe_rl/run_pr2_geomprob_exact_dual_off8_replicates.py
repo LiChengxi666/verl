@@ -16,6 +16,7 @@ MATRIX_RECIPE = Path(__file__).with_name("run_pr2_r2_and_geom_exact_aligned_matr
 LOSS_MODE = "prefix_geometric_probability_weighted_exact_kl_dual_clip"
 WANDB_GROUP = "pr2_geomprob_exact_dual_off8_seed_replication_20260828"
 SEEDS = {42, 43, 44}
+MISSING_DATA_SEED = object()
 
 
 def _load(path: Path, name: str):
@@ -46,6 +47,24 @@ def configure_dual_clip_replica(payload: dict, seed: int) -> None:
     payload["critic"]["megatron"]["seed"] = seed
 
 
+def validate_replica_seed_fields(payload: dict, seed: int, original_data_seed) -> None:
+    """Audit reference-vs-explicit replica seed semantics."""
+    if seed == 42:
+        if original_data_seed is MISSING_DATA_SEED:
+            assert "seed" not in payload["data"]
+        else:
+            assert payload["data"]["seed"] == original_data_seed
+        return
+
+    assert payload["data"]["seed"] == seed
+    actor_rollout_ref = payload["actor_rollout_ref"]
+    assert actor_rollout_ref["actor"]["data_loader_seed"] == seed
+    assert actor_rollout_ref["actor"]["megatron"]["seed"] == seed
+    assert actor_rollout_ref["ref"]["megatron"]["seed"] == seed
+    assert payload["critic"]["data_loader_seed"] == seed
+    assert payload["critic"]["megatron"]["seed"] == seed
+
+
 def main() -> None:
     from omegaconf import OmegaConf
 
@@ -70,6 +89,7 @@ def main() -> None:
         path.chmod(0o777)
 
     base = json.loads(base_source.BASE_CONFIG.read_text())
+    original_data_seed = base["data"].get("seed", MISSING_DATA_SEED)
     payload = matrix.configure(base, "geom_off8", state_root=state, source=source)
     trainer = payload["trainer"]
     trainer["experiment_name"] = run_id
@@ -107,7 +127,7 @@ def main() -> None:
     assert trainer["total_training_steps"] == 300
     assert trainer["nnodes"] == 4 and trainer["n_gpus_per_node"] == 8
     assert len(payload["data"]["val_files"]) == 4
-    assert payload["data"]["seed"] == seed
+    validate_replica_seed_fields(payload, seed, original_data_seed)
     print(
         "GEOM_EXACT_DUAL_OFF8_REPLICA_AUDIT",
         f"seed={seed}",
