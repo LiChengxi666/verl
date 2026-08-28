@@ -14,7 +14,7 @@ CODE_ROOT = ROOT / "verl"
 VENDOR_DIR = CODE_ROOT / ".ray_vendor"
 MATRIX_RECIPE = Path(__file__).with_name("run_pr2_r2_and_geom_exact_aligned_matrix.py")
 LOSS_MODE = "prefix_geometric_probability_weighted_exact_kl_dual_clip"
-WANDB_GROUP = "pr2_geomprob_exact_dual_off8_seed_replication_20260828"
+WANDB_GROUP = "pr2_best_exact_prefix_off8_seed_replication_20260826"
 SEEDS = {42, 43, 44}
 MISSING_DATA_SEED = object()
 

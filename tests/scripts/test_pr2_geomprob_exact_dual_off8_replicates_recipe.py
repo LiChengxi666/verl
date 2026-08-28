@@ -71,6 +71,12 @@ def test_recipe_rejects_unplanned_seed():
         recipe.configure_dual_clip_replica(_payload(), 45)
 
 
+def test_replicas_join_existing_off8_seed_group():
+    recipe = _load_recipe()
+
+    assert recipe.WANDB_GROUP == "pr2_best_exact_prefix_off8_seed_replication_20260826"
+
+
 def test_reference_replica_audit_accepts_missing_data_seed():
     recipe = _load_recipe()
     payload = _payload()
