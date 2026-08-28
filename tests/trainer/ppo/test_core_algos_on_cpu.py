@@ -27,6 +27,7 @@ from verl.trainer.ppo.core_algos import (
     compute_policy_loss_prefix_exact_kl_clip,
     compute_policy_loss_prefix_exact_kl_cumulative_dual_clip,
     compute_policy_loss_prefix_geometric_probability_weighted_exact_kl_clip,
+    compute_policy_loss_prefix_geometric_probability_weighted_exact_kl_dual_clip,
     compute_policy_loss_prefix_probability_weighted_exact_kl_clip,
     compute_policy_loss_prefix_probability_weighted_exact_kl_cumulative_dual_clip,
     compute_policy_loss_prefix_ripo_clip,
@@ -399,6 +400,58 @@ def test_geometric_probability_weighted_exact_prefix_uses_length_normalized_old_
     assert metrics[f"{prefix}/geometric_average_surrogate"] == 1.0
     assert get_policy_loss_fn("prefix_geometric_probability_weighted_exact_kl_clip") is (
         compute_policy_loss_prefix_geometric_probability_weighted_exact_kl_clip
+    )
+
+
+def test_geometric_probability_weighted_exact_prefix_dual_clip_only_changes_negative_upper_branch():
+    old_log_prob = torch.zeros((2, 1))
+    log_prob = torch.full((2, 1), np.log(4.0), requires_grad=True)
+    response_mask = torch.ones_like(old_log_prob)
+    advantages = torch.tensor([[-1.0], [1.0]])
+    # With t=1 and pi_old=1, R=2 is the exact upper root.
+    delta_high = 1.0 - np.log(2.0)
+    config = ActorConfig(
+        strategy="fsdp",
+        rollout_n=1,
+        ppo_micro_batch_size=1,
+        policy_loss=PolicyLossConfig(
+            prefix_exact_kl_delta_low=100.0,
+            prefix_exact_kl_delta_high=delta_high,
+        ),
+    )
+
+    original_loss, original_metrics = compute_policy_loss_prefix_geometric_probability_weighted_exact_kl_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob.detach().clone().requires_grad_(True),
+        advantages=advantages,
+        response_mask=response_mask,
+        config=config,
+    )
+    loss, metrics = compute_policy_loss_prefix_geometric_probability_weighted_exact_kl_dual_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        config=config,
+    )
+
+    prefix = "actor/prefix_geometric_probability_weighted_exact_kl_dual_clip"
+    assert original_loss.item() == pytest.approx(1.0)
+    assert original_metrics[
+        "actor/prefix_geometric_probability_weighted_exact_kl_clip/dual_clip_negative_advantage"
+    ] == pytest.approx(0.0)
+    assert loss.item() == pytest.approx(0.0, abs=1e-6)
+    assert metrics[f"{prefix}/geometric_probability_weighted"] == 1.0
+    assert metrics[f"{prefix}/geometric_average_surrogate"] == 1.0
+    assert metrics[f"{prefix}/dual_clip_negative_advantage"] == 1.0
+    assert metrics[f"{prefix}/dual_clipfrac"] == pytest.approx(0.5)
+    assert metrics[f"{prefix}/negative_adv_upper_violation_frac"] == pytest.approx(1.0)
+    assert metrics[f"{prefix}/negative_adv_raw_branch_selected_frac"] == pytest.approx(1.0)
+    assert metrics[f"{prefix}/effective_ratio_max"] == pytest.approx(2.0)
+    assert metrics[f"{prefix}/dual_excess_log_ratio_mean"] == pytest.approx(np.log(2.0))
+    assert metrics[f"{prefix}/pos_bucket_09_10/dual_clipfrac"] == pytest.approx(0.5)
+    assert get_policy_loss_fn("prefix_geometric_probability_weighted_exact_kl_dual_clip") is (
+        compute_policy_loss_prefix_geometric_probability_weighted_exact_kl_dual_clip
     )
 
 
