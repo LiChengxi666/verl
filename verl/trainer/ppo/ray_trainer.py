@@ -1171,6 +1171,11 @@ class RayPPOTrainer:
             return 0
 
         remote_global_step_folder = None
+        explicit_hdfs_step = None
+        if self.config.trainer.default_hdfs_dir is not None and self.config.trainer.resume_mode == "resume_path":
+            assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
+            assert "global_step_" in self.config.trainer.resume_from_path, "resume ckpt must specify the global_steps"
+            explicit_hdfs_step = int(self.config.trainer.resume_from_path.rsplit("global_step_", 1)[-1])
         # load from hdfs
         if self.config.trainer.default_hdfs_dir is not None:
             from verl.utils import hdfs_io
@@ -1178,10 +1183,17 @@ class RayPPOTrainer:
 
             remote_tracker = os.path.join(self.config.trainer.default_hdfs_dir, "latest_checkpointed_iteration.txt")
             if hdfs_io.exists(remote_tracker):
-                global_step_folder, remote_global_step_folder = download_remote_metadata(
-                    self.config.trainer.default_hdfs_dir,
-                    self.config.trainer.default_local_dir,
-                )
+                if explicit_hdfs_step is None:
+                    global_step_folder, remote_global_step_folder = download_remote_metadata(
+                        self.config.trainer.default_hdfs_dir,
+                        self.config.trainer.default_local_dir,
+                    )
+                else:
+                    global_step_folder, remote_global_step_folder = download_remote_metadata(
+                        self.config.trainer.default_hdfs_dir,
+                        self.config.trainer.default_local_dir,
+                        step=explicit_hdfs_step,
+                    )
             else:
                 global_step_folder = None
         else:
@@ -1197,7 +1209,7 @@ class RayPPOTrainer:
                 print("Training from scratch")
                 return 0
         else:
-            if self.config.trainer.resume_mode == "resume_path":
+            if self.config.trainer.resume_mode == "resume_path" and self.config.trainer.default_hdfs_dir is None:
                 assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
                 assert "global_step_" in self.config.trainer.resume_from_path, (
                     "resume ckpt must specify the global_steps"

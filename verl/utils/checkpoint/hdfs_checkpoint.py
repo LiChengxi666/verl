@@ -302,12 +302,13 @@ def publish_remote_metadata(remote_root: str, local_step_folder: str | Path, loc
     _copy_required(str(local_tracker), os.path.join(remote_root, "latest_checkpointed_iteration.txt"))
 
 
-def download_remote_metadata(remote_root: str, local_root: str | Path) -> tuple[str, str]:
+def download_remote_metadata(remote_root: str, local_root: str | Path, step: int | None = None) -> tuple[str, str]:
     local_root = Path(local_root)
     local_root.mkdir(parents=True, exist_ok=True)
-    local_tracker = local_root / "latest_checkpointed_iteration.txt"
-    _copy_required_to_local(os.path.join(remote_root, local_tracker.name), local_tracker)
-    step = int(local_tracker.read_text(encoding="utf-8").strip())
+    if step is None:
+        local_tracker = local_root / "latest_checkpointed_iteration.txt"
+        _copy_required_to_local(os.path.join(remote_root, local_tracker.name), local_tracker)
+        step = int(local_tracker.read_text(encoding="utf-8").strip())
     local_step = local_root / f"global_step_{step}"
     remote_step = os.path.join(remote_root, local_step.name)
     local_step.mkdir(parents=True, exist_ok=True)

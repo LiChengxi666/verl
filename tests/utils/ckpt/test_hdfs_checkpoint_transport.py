@@ -86,6 +86,27 @@ def test_download_remote_metadata_accepts_actor_only_checkpoint(tmp_path, monkey
     assert not (tmp_path / "global_step_5/data.pt").exists()
 
 
+def test_download_remote_metadata_can_restore_explicit_step_without_following_latest(tmp_path, monkeypatch):
+    remote = "hdfs://cluster/moving-run"
+    fake = FakeHdfs(
+        {
+            f"{remote}/latest_checkpointed_iteration.txt": b"95",
+            f"{remote}/global_step_80/data.pt": b"step-80-loader",
+            f"{remote}/global_step_80/_SUCCESS": b'{"global_step": 80}',
+            f"{remote}/global_step_95/data.pt": b"step-95-loader",
+            f"{remote}/global_step_95/_SUCCESS": b'{"global_step": 95}',
+        }
+    )
+    monkeypatch.setattr(hdfs_checkpoint, "hdfs_io", fake)
+
+    local_step, remote_step = hdfs_checkpoint.download_remote_metadata(remote, tmp_path, step=80)
+
+    assert local_step == str(tmp_path / "global_step_80")
+    assert remote_step == f"{remote}/global_step_80"
+    assert (tmp_path / "global_step_80/data.pt").read_bytes() == b"step-80-loader"
+    assert f"{remote}/latest_checkpointed_iteration.txt" not in [src for src, _ in fake.copies]
+
+
 def test_download_remote_metadata_atomically_replaces_stale_local_files(tmp_path, monkeypatch):
     remote = "hdfs://cluster/resumed-run"
     local_step = tmp_path / "global_step_15"

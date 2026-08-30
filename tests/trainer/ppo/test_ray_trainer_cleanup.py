@@ -96,3 +96,38 @@ def test_hdfs_resume_passes_remote_paths_to_actor_and_critic(tmp_path, monkeypat
     assert critic_wg.load_calls == [
         ((str(local_step / "critic"), f"{remote_step}/critic", True), {})
     ]
+
+
+def test_hdfs_resume_path_downloads_the_requested_step_not_latest(tmp_path, monkeypatch):
+    requested_step = tmp_path / "global_step_80"
+    remote_step = "hdfs://cluster/checkpoints/run/global_step_80"
+    actor_wg = _CheckpointWorkerGroup()
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.config = SimpleNamespace(
+        trainer=SimpleNamespace(
+            resume_mode="resume_path",
+            resume_from_path=str(requested_step),
+            default_hdfs_dir="hdfs://cluster/checkpoints/run",
+            default_local_dir=str(tmp_path),
+            del_local_ckpt_after_load=True,
+        )
+    )
+    trainer.rollout_buffer = None
+    trainer.use_critic = False
+    trainer.actor_rollout_wg = actor_wg
+    monkeypatch.setattr(hdfs_io, "exists", lambda _: True)
+    calls = []
+
+    def download(_remote, _local, step=None):
+        calls.append((_remote, _local, step))
+        return str(requested_step), remote_step
+
+    monkeypatch.setattr(hdfs_checkpoint, "download_remote_metadata", download)
+
+    trainer._load_checkpoint()
+
+    assert calls == [("hdfs://cluster/checkpoints/run", str(tmp_path), 80)]
+    assert trainer.global_steps == 80
+    assert actor_wg.load_calls == [
+        ((str(requested_step / "actor"), f"{remote_step}/actor", True), {})
+    ]
