@@ -30,6 +30,12 @@ SETTINGS = {
     "geom_off8": {"mini_batch": 8, "lr": 1.0e-6, "loss": LOSS_MODE, "router_replay": "disabled"},
     "grpo_r2_off8": {"mini_batch": 8, "lr": 1.0e-6, "loss": "vanilla", "router_replay": "R2"},
     "grpo_r3_off8": {"mini_batch": 8, "lr": 1.0e-6, "loss": "vanilla", "router_replay": "R3"},
+    "grpo_nokl_clip020_028_off8_seed43": {
+        "mini_batch": 8, "lr": 1.0e-6, "loss": "vanilla", "router_replay": "disabled", "seed": 43,
+    },
+    "grpo_nokl_clip020_028_off8_seed44": {
+        "mini_batch": 8, "lr": 1.0e-6, "loss": "vanilla", "router_replay": "disabled", "seed": 44,
+    },
 }
 
 
@@ -51,12 +57,15 @@ def identities(mode: str) -> tuple[str, str, str]:
         "geom_off8": "PR2_geomprob_exact_d5e4_2e3_off8_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr1e-6_300",
         "grpo_r2_off8": "PR2_GRPO_R2_off8_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr1e-6_clip0p2_0p28_nokl_300",
         "grpo_r3_off8": "PR2_GRPO_R3_off8_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr1e-6_clip0p2_0p28_nokl_300",
+        "grpo_nokl_clip020_028_off8_seed43": "PR2_GRPO_noKL_off8_clipL0p2_H0p28_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr1e-6_seed43_300",
+        "grpo_nokl_clip020_028_off8_seed44": "PR2_GRPO_noKL_off8_clipL0p2_H0p28_oversample0p1_qwen3_30b_a3b_4x8_b64n8_r16384_lr1e-6_seed44_300",
     }
     run_id = names[mode]
-    date_slug = "20260824" if mode.startswith("grpo_r") else "20260820"
-    nokl_slug = "_nokl" if mode.startswith("grpo_r") else ""
+    is_grpo = mode.startswith("grpo_r") or mode.startswith("grpo_nokl_")
+    date_slug = "20260830" if mode.startswith("grpo_nokl_") else ("20260824" if mode.startswith("grpo_r") else "20260820")
+    nokl_slug = "_nokl" if is_grpo else ""
     state_slug = f"{mode}_aligned{nokl_slug}_moe32_{date_slug}"
-    alignment_slug = "aligned-nokl-over01" if mode.startswith("grpo_r") else "aligned-over01"
+    alignment_slug = "aligned-nokl-over01" if is_grpo else "aligned-over01"
     hdfs_dir = (
         "hdfs://harunawl/home/byte_data_seed_wl/user/wu.hanlin/offpolicyrl/checkpoints/"
         f"moe-{mode.replace('_', '-')}-{alignment_slug}-r16384-4x8-{date_slug}"
@@ -124,8 +133,8 @@ def configure(base: dict, mode: str, *, state_root: Path, source) -> dict:
     actor["policy_loss"]["prefix_exact_kl_delta_low"] = DELTA_LOW
     actor["policy_loss"]["prefix_exact_kl_delta_high"] = DELTA_HIGH
     actor["megatron"]["router_replay"]["mode"] = setting["router_replay"]
-    is_grpo_router_replay = mode.startswith("grpo_r")
-    if is_grpo_router_replay:
+    is_grpo = mode.startswith("grpo_r") or mode.startswith("grpo_nokl_")
+    if is_grpo:
         actor["loss_agg_mode"] = "token-mean"
         actor["use_kl_loss"] = False
         actor["kl_loss_coef"] = 0.0
@@ -134,10 +143,18 @@ def configure(base: dict, mode: str, *, state_root: Path, source) -> dict:
         actor["clip_ratio_high"] = 0.28
     rollout = payload["actor_rollout_ref"]["rollout"]
     rollout["enable_rollout_routing_replay"] = mode == "grpo_r3_off8"
-    if is_grpo_router_replay:
+    if is_grpo:
         payload["ray_kwargs"]["ray_init"]["runtime_env"]["env_vars"]["WANDB_RUN_GROUP"] = (
             GRPO_OFF8_WANDB_GROUP
         )
+    if "seed" in setting:
+        seed = setting["seed"]
+        payload["data"]["seed"] = seed
+        actor["data_loader_seed"] = seed
+        actor["megatron"]["seed"] = seed
+        payload["actor_rollout_ref"]["ref"]["megatron"]["seed"] = seed
+        payload["critic"]["data_loader_seed"] = seed
+        payload["critic"]["megatron"]["seed"] = seed
     return payload
 
 
@@ -160,7 +177,8 @@ def main() -> None:
     source._load_source_recipe().load_environment(state, run_id)
     sys.path.insert(0, str(source.VENDOR_DIR))
     os.environ["PYTHONPATH"] = f"{source.VENDOR_DIR}:{source.CODE_ROOT}"
-    wandb_group = GRPO_OFF8_WANDB_GROUP if mode.startswith("grpo_r") else WANDB_GROUP
+    is_grpo = mode.startswith("grpo_r") or mode.startswith("grpo_nokl_")
+    wandb_group = GRPO_OFF8_WANDB_GROUP if is_grpo else WANDB_GROUP
     os.environ["WANDB_RUN_GROUP"] = wandb_group
     source._load_source_recipe().require_official_wandb()
     if mode == "grpo_r3_off8":
@@ -185,7 +203,7 @@ def main() -> None:
     assert actor["policy_loss"]["loss_mode"] == setting["loss"]
     assert actor["megatron"]["router_replay"]["mode"] == setting["router_replay"]
     assert rollout["enable_rollout_routing_replay"] is (mode == "grpo_r3_off8")
-    if mode.startswith("grpo_r"):
+    if is_grpo:
         assert actor["loss_agg_mode"] == "token-mean"
         assert actor["use_kl_loss"] is False and actor["kl_loss_coef"] == 0.0
         assert actor["clip_ratio"] == actor["clip_ratio_low"] == 0.2
@@ -198,6 +216,12 @@ def main() -> None:
     assert trainer["total_training_steps"] == 300
     assert trainer["nnodes"] == 4 and trainer["n_gpus_per_node"] == 8
     assert len(payload["data"]["val_files"]) == 4
+    if "seed" in setting:
+        seed = setting["seed"]
+        assert payload["data"]["seed"] == seed
+        assert actor["data_loader_seed"] == actor["megatron"]["seed"] == seed
+        assert payload["actor_rollout_ref"]["ref"]["megatron"]["seed"] == seed
+        assert payload["critic"]["data_loader_seed"] == payload["critic"]["megatron"]["seed"] == seed
     print(
         "PR2_R2_GEOM_EXACT_MATRIX_CONFIG_AUDIT",
         f"mode={mode}", f"run_id={run_id}", f"wandb_group={wandb_group}",

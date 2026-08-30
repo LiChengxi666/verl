@@ -34,10 +34,11 @@ def _base_config():
         "actor_rollout_ref": {
             "_checkpoint_hdfs_dir": "",
             "actor": {
+                "data_loader_seed": 42,
                 "ppo_mini_batch_size": 32,
                 "optim": {"lr": 2.0e-6},
                 "policy_loss": {"loss_mode": "gspo"},
-                "megatron": {"router_replay": {"mode": "disabled"}},
+                "megatron": {"seed": 42, "router_replay": {"mode": "disabled"}},
                 "loss_agg_mode": "seq-mean-token-mean",
                 "use_kl_loss": True,
                 "kl_loss_coef": 1.0e-3,
@@ -45,6 +46,7 @@ def _base_config():
                 "clip_ratio_low": 0.2,
                 "clip_ratio_high": 0.2,
             },
+            "ref": {"megatron": {"seed": 42}},
             "rollout": {
                 "enable_rollout_routing_replay": False,
                 "over_sample_rate": 0.1,
@@ -53,7 +55,7 @@ def _base_config():
                 "trace": {"experiment_name": ""},
             },
         },
-        "critic": {"ppo_mini_batch_size": 32},
+        "critic": {"ppo_mini_batch_size": 32, "data_loader_seed": 42, "megatron": {"seed": 42}},
         "trainer": {
             "project_name": "verl_moe_router_replay",
             "experiment_name": "",
@@ -133,3 +135,36 @@ def test_existing_hdfs_requires_explicit_complete_checkpoint_resume():
     existing.remove(f"{root}/global_step_5/_SUCCESS")
     with pytest.raises(RuntimeError, match="incomplete checkpoint"):
         recipe.validate_hdfs_target(root, allow_resume=True, exists=exists, read_text=read_text)
+
+
+@pytest.mark.parametrize("seed", [43, 44])
+def test_grpo_clip_higher_seed_replica_only_overrides_established_seed_fields(seed, tmp_path):
+    recipe = _load_recipe()
+    mode = f"grpo_nokl_clip020_028_off8_seed{seed}"
+    run_id, state_slug, hdfs_dir = recipe.identities(mode)
+    payload = recipe.configure(_base_config(), mode, state_root=tmp_path, source=_Source())
+
+    actor = payload["actor_rollout_ref"]["actor"]
+    rollout = payload["actor_rollout_ref"]["rollout"]
+    assert payload["data"]["seed"] == seed
+    assert actor["data_loader_seed"] == seed
+    assert actor["megatron"]["seed"] == seed
+    assert payload["actor_rollout_ref"]["ref"]["megatron"]["seed"] == seed
+    assert payload["critic"]["data_loader_seed"] == seed
+    assert payload["critic"]["megatron"]["seed"] == seed
+
+    assert actor["policy_loss"]["loss_mode"] == "vanilla"
+    assert actor["use_kl_loss"] is False and actor["kl_loss_coef"] == 0.0
+    assert actor["clip_ratio_low"] == 0.2 and actor["clip_ratio_high"] == 0.28
+    assert actor["ppo_mini_batch_size"] == 8 and actor["optim"]["lr"] == 1.0e-6
+    assert actor["megatron"]["router_replay"]["mode"] == "disabled"
+    assert rollout["enable_rollout_routing_replay"] is False
+    assert rollout["over_sample_rate"] == 0.1 and rollout["n"] == 8
+    assert payload["trainer"]["total_training_steps"] == 300
+    assert payload["trainer"]["nnodes"] == 4 and payload["trainer"]["n_gpus_per_node"] == 8
+    assert payload["ray_kwargs"]["ray_init"]["runtime_env"]["env_vars"]["WANDB_RUN_GROUP"] == (
+        "PR2_off8_method_comparison_over01"
+    )
+    assert f"seed{seed}" in run_id
+    assert f"seed{seed}" in state_slug
+    assert f"seed{seed}" in hdfs_dir
