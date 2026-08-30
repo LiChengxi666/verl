@@ -2509,15 +2509,21 @@ def _compute_policy_loss_prefix_exact_kl_clip(
     ratio_clip_for_loss = torch.exp(prefix_log_importance_ratio_clip)
     pg_losses1 = -advantages * ratio_for_loss
     pg_losses2 = -advantages * ratio_clip_for_loss
+    raw_branch_selected = pg_losses1 > pg_losses2
     pg_losses = torch.maximum(pg_losses1, pg_losses2)
 
+    dual_log_cap = torch.clamp(surrogate_upper_log_bound, min=-10.0, max=10.0)
+    dual_ratio_cap = torch.exp(dual_log_cap)
+    negative_adv_mask = (advantages < 0) & response_mask.bool()
+    negative_adv_upper_violation = negative_adv_mask & (ratio_for_loss > dual_ratio_cap)
     dual_clipped = torch.zeros_like(response_mask, dtype=torch.bool)
     if dual_clip_negative_advantage:
-        dual_log_cap = torch.clamp(surrogate_upper_log_bound, min=-10.0, max=10.0)
-        dual_ratio_cap = torch.exp(dual_log_cap)
         dual_loss_cap = -advantages * dual_ratio_cap
-        dual_clipped = (advantages < 0) & (ratio_for_loss > dual_ratio_cap)
+        dual_clipped = negative_adv_upper_violation
         pg_losses = torch.where(advantages < 0, torch.minimum(pg_losses, dual_loss_cap), pg_losses)
+
+    selected_ratio_before_dual = torch.where(raw_branch_selected, ratio_for_loss, ratio_clip_for_loss)
+    effective_ratio = torch.where(dual_clipped, dual_ratio_cap, selected_ratio_before_dual)
 
     if rollout_is_weights is not None:
         pg_losses = pg_losses * rollout_is_weights
@@ -2562,6 +2568,21 @@ def _compute_policy_loss_prefix_exact_kl_clip(
         if valid_raw_ratios.numel()
         else torch.zeros((), device=ratio_for_loss.device)
     )
+    valid_effective_ratios = effective_ratio.detach()[response_mask.bool()].float()
+    effective_ratio_p95 = (
+        torch.quantile(valid_effective_ratios, 0.95)
+        if valid_effective_ratios.numel()
+        else torch.zeros((), device=ratio_for_loss.device)
+    )
+
+    def _conditional_fraction(value_mask: torch.Tensor, condition_mask: torch.Tensor) -> torch.Tensor:
+        condition = condition_mask & response_mask.bool()
+        denominator = condition.float().sum().clamp(min=1.0)
+        return (value_mask & condition).float().sum() / denominator
+
+    dual_excess_log_ratio = torch.clamp(prefix_log_importance_ratio.detach() - dual_log_cap.detach(), min=0.0)
+    dual_clipped_count = dual_clipped.float().sum().clamp(min=1.0)
+    dual_excess_log_ratio_mean = (dual_excess_log_ratio * dual_clipped.float()).sum() / dual_clipped_count
 
     metric_prefix = f"actor/{loss_name}"
     pg_metrics = {
@@ -2578,12 +2599,32 @@ def _compute_policy_loss_prefix_exact_kl_clip(
         f"{metric_prefix}/dual_clipfrac": verl_F.masked_mean(
             dual_clipped.float(), response_mask
         ).detach().item(),
+        f"{metric_prefix}/negative_adv_upper_violation_frac": _conditional_fraction(
+            negative_adv_upper_violation, negative_adv_mask
+        ).detach().item(),
+        f"{metric_prefix}/negative_adv_raw_branch_selected_frac": _conditional_fraction(
+            raw_branch_selected, negative_adv_mask
+        ).detach().item(),
+        f"{metric_prefix}/negative_adv_upper_raw_branch_frac": _conditional_fraction(
+            raw_branch_selected, negative_adv_upper_violation
+        ).detach().item(),
+        f"{metric_prefix}/raw_branch_selected_frac": verl_F.masked_mean(
+            raw_branch_selected.float(), response_mask
+        ).detach().item(),
+        f"{metric_prefix}/dual_excess_log_ratio_mean": dual_excess_log_ratio_mean.detach().item(),
         f"{metric_prefix}/raw_ratio_mean": verl_F.masked_mean(
             ratio_for_loss.detach(), response_mask
         ).item(),
         f"{metric_prefix}/raw_ratio_p95": raw_ratio_p95.item(),
         f"{metric_prefix}/raw_ratio_max": torch.where(
             response_mask.bool(), ratio_for_loss.detach(), torch.zeros_like(ratio_for_loss)
+        ).max().item(),
+        f"{metric_prefix}/effective_ratio_mean": verl_F.masked_mean(
+            effective_ratio.detach(), response_mask
+        ).item(),
+        f"{metric_prefix}/effective_ratio_p95": effective_ratio_p95.item(),
+        f"{metric_prefix}/effective_ratio_max": torch.where(
+            response_mask.bool(), effective_ratio.detach(), torch.zeros_like(effective_ratio)
         ).max().item(),
         f"{metric_prefix}/avg_log_ratio_abs_mean": verl_F.masked_mean(
             prefix_avg_log_ratio.detach().abs(), response_mask
@@ -2627,6 +2668,18 @@ def _compute_policy_loss_prefix_exact_kl_clip(
         ).detach().item()
         pg_metrics[f"{bucket_prefix}/pg_clipfrac_lower"] = verl_F.masked_mean(
             lower_clipped.float(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/dual_clipfrac"] = verl_F.masked_mean(
+            dual_clipped.float(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/negative_adv_upper_violation_frac"] = _conditional_fraction(
+            negative_adv_upper_violation, negative_adv_mask & bucket_mask
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/raw_branch_selected_frac"] = verl_F.masked_mean(
+            raw_branch_selected.float(), bucket_mask_float
+        ).detach().item()
+        pg_metrics[f"{bucket_prefix}/effective_ratio_mean"] = verl_F.masked_mean(
+            effective_ratio.detach(), bucket_mask_float
         ).detach().item()
         pg_metrics[f"{bucket_prefix}/upper_avg_log_bound_mean"] = verl_F.masked_mean(
             upper_avg_log_bound.detach(), bucket_mask_float
@@ -2690,6 +2743,34 @@ def compute_policy_loss_prefix_geometric_probability_weighted_exact_kl_clip(
         geometric_average_surrogate=True,
         dual_clip_negative_advantage=False,
         loss_name="prefix_geometric_probability_weighted_exact_kl_clip",
+    )
+
+
+@register_policy_loss("prefix_geometric_probability_weighted_exact_kl_dual_clip")
+def compute_policy_loss_prefix_geometric_probability_weighted_exact_kl_dual_clip(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Geometric-probability exact-prefix loss with negative-advantage dual clip."""
+
+    return _compute_policy_loss_prefix_exact_kl_clip(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_is_weights=rollout_is_weights,
+        probability_weighted=False,
+        geometric_probability_weighted=True,
+        geometric_average_surrogate=True,
+        dual_clip_negative_advantage=True,
+        loss_name="prefix_geometric_probability_weighted_exact_kl_dual_clip",
     )
 
 
