@@ -130,13 +130,6 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         if local_path is None:
             return
         hdfs_path = _resolve_hdfs_checkpoint_path(local_path, hdfs_path)
-        remove_local_after_hdfs_save = bool(
-            self.checkpoint_config and self.checkpoint_config.get("remove_local_after_hdfs_save", False)
-        )
-        if remove_local_after_hdfs_save and hdfs_path is None:
-            raise ValueError("remove_local_after_hdfs_save requires an HDFS checkpoint path")
-        if remove_local_after_hdfs_save and self.should_save_hf_model:
-            raise ValueError("remove_local_after_hdfs_save does not support save_contents containing hf_model")
         checkpoint_path = hdfs_path or local_path
 
         # check if the checkpoint_load_contents is valid
@@ -229,6 +222,13 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         """
         if local_path is None:
             return
+        remove_local_after_hdfs_save = bool(
+            self.checkpoint_config and self.checkpoint_config.get("remove_local_after_hdfs_save", False)
+        )
+        if remove_local_after_hdfs_save and hdfs_path is None:
+            raise ValueError("remove_local_after_hdfs_save requires an HDFS checkpoint path")
+        if remove_local_after_hdfs_save and self.should_save_hf_model:
+            raise ValueError("remove_local_after_hdfs_save does not support save_contents containing hf_model")
 
         hdfs_path = _resolve_hdfs_checkpoint_path(local_path, hdfs_path)
 
